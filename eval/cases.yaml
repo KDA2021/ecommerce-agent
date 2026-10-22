@@ -1,0 +1,116 @@
+# P5 评测回归用例集
+#
+# 字段说明：
+#   id                用例唯一标识
+#   kind              用例类型：search / rag / preference / order / general
+#   query             发给 Agent 的用户问题
+#   buyer_id          评测专用买家（合成身份，不涉及真实用户）
+#   must_contain      回答应覆盖的要点（用于确定性字面记录 + 供裁判参考，同义表述由裁判判定）
+#   must_not_contain  回答中不应出现的编造/越界内容
+#
+# 说明：脚本对每条用例使用全新 thread 直连 invoke_agent，语义缓存不参与。
+cases:
+  # ---------- search：商品检索 ----------
+  - id: search-travel-set-budget
+    kind: search
+    query: "帮我找一个旅行三件套，预算 200 元以内"
+    buyer_id: eval-buyer-search
+    must_contain: ["旅行三件套", "元"]
+    must_not_contain: []
+
+  - id: search-luggage-aluminum
+    kind: search
+    query: "想买一个 20 寸铝框登机箱，预算 1200 元以内"
+    buyer_id: eval-buyer-search
+    must_contain: ["登机", "元"]
+    must_not_contain: []
+
+  - id: search-backpack-foldable
+    kind: search
+    query: "推荐一款可以折叠的轻量双肩包，容量 30-40L"
+    buyer_id: eval-buyer-search
+    must_contain: ["双肩包"]
+    must_not_contain: []
+
+  - id: search-nonexistent-phone-case
+    kind: search
+    query: "帮我找一款诺基亚 3310 的手机壳"
+    buyer_id: eval-buyer-search
+    must_contain: []
+    must_not_contain: ["立即购买", "加入购物车"]
+
+  # ---------- rag：品类知识（选购常识 / 避坑） ----------
+  - id: rag-travel-material
+    kind: rag
+    query: "旅行装备怎么挑材质？有什么坑？"
+    buyer_id: eval-buyer-rag
+    must_contain: ["材质"]
+    must_not_contain: []
+
+  - id: rag-cabin-size-rule
+    kind: rag
+    query: "20 寸登机箱是不是所有航司都能免托运？"
+    buyer_id: eval-buyer-rag
+    must_contain: ["航司"]
+    must_not_contain: []
+
+  - id: rag-silk-maintenance
+    kind: rag
+    query: "桑蚕丝睡袋内胆平时怎么保养？接受不了干洗的话有别的选择吗？"
+    buyer_id: eval-buyer-rag
+    must_contain: ["桑蚕丝"]
+    must_not_contain: []
+
+  # ---------- preference：长期偏好记忆 ----------
+  - id: preference-dislike-plastic
+    kind: preference
+    query: "记住我不喜欢塑料材质，之后推荐旅行装备时请避开"
+    buyer_id: eval-buyer-prefer
+    must_contain: ["塑料"]
+    must_not_contain: []
+
+  - id: preference-like-lightweight
+    kind: preference
+    query: "记住我偏好轻量的旅行装备"
+    buyer_id: eval-buyer-prefer-apply
+    must_contain: ["轻量"]
+    must_not_contain: []
+
+  # 与上一条共用 buyer：验证跨 thread 的偏好是否被真正记住并应用
+  - id: preference-apply-stored
+    kind: preference
+    query: "根据我的偏好推荐一款旅行装备"
+    buyer_id: eval-buyer-prefer-apply
+    must_contain: ["轻量"]
+    must_not_contain: []
+
+  # ---------- order：下单 / 查单 ----------
+  # 明确给出 SKU，保证「下单成功」路径可判定（返回 GBX 订单号）
+  - id: order-create-confirmed
+    kind: order
+    query: "确认下单：Nomadica 旅行三件套 军绿色（P1001-S1）1 件，收货地址浙江省杭州市西湖区某路 1 号，收件人张三，电话 13800000000。请直接创建订单，不用再和我确认。"
+    buyer_id: eval-buyer-order
+    must_contain: ["GBX"]
+    must_not_contain: []
+
+  - id: order-query-missing
+    kind: order
+    query: "帮我查一下订单 GBX-999999 现在是什么状态"
+    buyer_id: eval-buyer-order
+    must_contain: ["不存在"]
+    must_not_contain: ["已发货", "已签收"]
+
+  # ---------- general：非检索类通用问答 ----------
+  - id: general-math
+    kind: general
+    query: "顺便帮我算一道题：23 × 47 等于多少？"
+    buyer_id: eval-buyer-general
+    must_contain: ["1081"]
+    must_not_contain: []
+
+  - id: general-capability
+    kind: general
+    query: "你好，你能帮我做什么？"
+    buyer_id: eval-buyer-general
+    must_contain: []
+    must_not_contain: []

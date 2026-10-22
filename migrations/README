@@ -1,0 +1,31 @@
+# Alembic migrations（P11-2）
+
+本目录是 ecommerce-agent 的 MySQL schema 版本管理目录。
+
+## 文件说明
+
+| 文件 | 作用 |
+|---|---|
+| `env.py` | 运行时环境：从 `app.infrastructure.persistence.tables.Base.metadata` 取 metadata，从 `DATABASE_URL`（`app.infrastructure.settings`）取连接串；async 引擎 + `run_sync` 执行迁移，`--sql` 时自动把 async 驱动换成同步等价 URL。 |
+| `script.py.mako` | `alembic revision` 生成新文件用的模板。 |
+| `versions/` | 各 revision 脚本；`p11_0001_initial_schema.py` 是覆盖全部业务表的初始迁移。 |
+
+## 常用命令
+
+```powershell
+# 原生 CLI
+uv run alembic upgrade head
+uv run alembic revision --autogenerate -m "describe the change"
+
+# 项目封装入口（默认 upgrade head，支持 --auto-stamp / --sql / --database-url）
+uv run python scripts/migrate.py
+```
+
+## 约定
+
+1. **不要手改已经进过主干 / 别人可能已执行的 revision**；结构变更新增一个 revision。
+2. `bootstrap_schema`（`app/infrastructure/persistence/db.py`）保留为开发 / 测试快速路径：
+   它用 `create_all` 补齐缺表，因此测试库通常没有 `alembic_version`；
+   这类库用 `python scripts/migrate.py --auto-stamp` 先记录 head 基线再升级。
+3. 迁移测试见 `tests/test_migrations.py`：自动创建临时库、跑完即删，
+   覆盖「空库 upgrade head / downgrade base / migrate.py 真实进程 / bootstrap 兼容路径」。

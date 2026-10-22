@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+doc/
+docs/
+.ruff_cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+data/
+pytest-cache-files-*/
+.idea/
+.tmp-pytest/
+pytest-of-*/
+mkdtest/
+modetest/
+uvpymode/
+.pytest-basetemp-*/
+pytest-cache-files-*/
+.superpowers/
+rednote_exp/
+.pytest-tmp/
+
+# P15-1 make test 的临时目录（TMPDIR 默认值）
+.tmp-make/

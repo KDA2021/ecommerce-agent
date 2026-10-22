@@ -1,0 +1,143 @@
+# ecommerce-agent 本地编排（P15-3 收口）
+#
+# 用法（compose 文件在 docker/，所以 -f 与相对路径都以 docker/ 为基准）：
+#   cp .env.example .env                             # 仓库根目录，首次准备
+#   docker compose -f docker/docker-compose.yaml up -d --build
+#   #   → mysql:3307 / redis:6379 / app:8000 / frontend:80
+#
+# 前端默认跑**生产镜像**（nginx 托管 dist + 反代 /api → app:8000）。
+# 需要 Vite dev server 热更新时叠加 dev overlay：
+#   docker compose -f docker/docker-compose.yaml -f docker/docker-compose.frontend-dev.yaml up -d
+#
+# 只想要 MySQL（给 make test 的集成用例用）：docker/docker-compose.p1.yaml。
+#
+# 变量来源有两层，顺序不能弄反：
+#   1. env_file: ../.env —— 运行时整包注入（仓库根目录，.gitignore 忽略，用
+#      .env.example 生成）。Compose 的**插值**读的是 compose 文件同目录的
+#      docker/.env，不是这里，所以环境变量默认值只用来兜底；
+#   2. environment —— 覆盖 env_file，装容器内网地址（mysql / redis / app 这类
+#      service 名）与只在部署时才成立的口径。
+# 关键：`${VAR:-默认值}` 的默认值只在环境变量**未设置**时生效，一旦 .env 里显式
+# 设成空串（例如 LLM_API_KEY=）就会真的变成空串——这正是可选凭据想要的行为。
+# 反过来，DATA_DIR / CHROMA_DIR 这类「空串会被当成有效值」的字段必须给死值，
+# 不能让空 .env 覆盖成空路径。
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: ecommerce-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ecommerce
+      MYSQL_USER: ecommerce
+      MYSQL_PASSWORD: ecommerce
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uecommerce", "-pecommerce"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # P9：可选 Redis。app 里 REDIS_URL 为空时能力整体关闭；
+  # 这里给出默认连接串，故障时 RedisCache 会 fail-safe 降级。
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      # compose 文件位于 docker/，context 指回仓库根目录以复用根 Dockerfile。
+      context: ..
+      dockerfile: Dockerfile
+    image: ecommerce-agent:0.1.0
+    container_name: ecommerce-app
+    restart: unless-stopped
+    # 根目录 .env 整包注入；文件缺失时继续起（其余变量都有默认值）。
+    env_file:
+      - path: ../.env
+        required: false
+    ports:
+      - "8000:8000"
+    environment:
+      # ── 容器内网地址：必须覆盖 .env 里的 localhost 口径 ──
+      DATABASE_URL: mysql+asyncmy://ecommerce:ecommerce@mysql:3306/ecommerce?charset=utf8mb4
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # ── 可写目录：都在 app-data 卷里，空 .env 不能把它们覆盖成空串 ──
+      DATA_DIR: /app/data
+      CHROMA_DIR: /app/data/chroma
+      # ── 用户凭据 / 开关：透传 .env，未配置时由 app 自己按默认值兜底 ──
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_KEY: ${API_KEY:-}
+      SEMANTIC_CACHE_ENABLED: ${SEMANTIC_CACHE_ENABLED:-1}
+      MODEL_ROUTE_MODE: ${MODEL_ROUTE_MODE:-llm}
+      QUEUE_MODE: ${QUEUE_MODE:-direct}
+      # ── 只在部署口径下有意义的默认值（可被 .env 覆盖）──
+      # 精排在 CPU 上要下 ~1.1GB 权重并预热：镜像里 HF_HOME 指向 app-data 卷，
+      # 首次起来会慢（healthcheck start_period 已按此放宽），之后走卷内缓存。
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-1}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
+    volumes:
+      - app-data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 与 Dockerfile 的 HEALTHCHECK 同口径，显式写在这里让「服务是否就绪」
+    # 在 compose 层可读；/health 不鉴权、不查库，是最轻的判据。
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).read()
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  # 生产镜像：多阶段 node build → nginx:alpine（静态 dist + /api 反代到 app:8000）。
+  # 源码目录不进镜像，只在构建阶段被 COPY，运行期不可能被宿主机文件改动污染。
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    image: ecommerce-agent-frontend:0.1.0
+    container_name: ecommerce-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/index.html"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  mysql-data:
+  app-data:
+  redis-data:

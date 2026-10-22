@@ -1,0 +1,20 @@
+# pre-commit：ruff format + ruff check（基础规则）。
+#
+# 版本口径：钩子版本与 `pyproject.toml` 的 dev 依赖 ruff 保持一致（0.17.x），
+# 避免"本地 uv run ruff"与"pre-commit 独立环境"结论不一致。
+#
+# 使用：
+#   uv run pre-commit install     # 装 git hook（每次 commit 只跑改动文件）
+#   uv run pre-commit run --all-files   # 全量跑一遍
+#
+# 说明：两个钩子都只作用于 staged 文件，因此历史文件不会被顺手重排
+# （`pyproject.toml` 里 `[tool.ruff]` 的 line-length / exclude 是唯一权威配置）。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.0
+    hooks:
+      # 1) 格式化：等价 `ruff format`
+      - id: ruff-format
+      # 2) 基础检查：pycodestyle 明显问题 + pyflakes（含未使用导入）+ 导入排序
+      - id: ruff-check
+        args: [--fix]

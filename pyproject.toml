@@ -1,0 +1,86 @@
+[project]
+name = "ecommerce-agent"
+version = "0.1.0"
+description = "Globex 学习版：LangGraph + MySQL + Chroma 的跨境电商多 Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "alembic>=1.20.0",
+    "asyncmy>=0.2",
+    "chromadb>=0.5",
+    "cryptography>=42",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "langgraph>=0.4",
+    "langgraph-checkpoint-mysql[asyncmy]>=2.0,<3",
+    "python-dotenv>=1.0",
+    "redis>=5",
+    "sentence-transformers>=3,<6",
+    "sqlalchemy[asyncio]>=2.0",
+    "sse-starlette>=2",
+    "torch>=2.9,<2.10",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "fakeredis>=2.39.0",
+    "pre-commit>=4.7.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.17.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-p no:cacheprovider"
+filterwarnings = ["ignore:.*BlockingPortal alias.*:DeprecationWarning"]
+
+[tool.ruff]
+# 与既有代码风格对齐（现有文件多为 ≤100 列的手工换行）；同时也是最常见的工程默认值。
+line-length = 100
+# 全局排除：前端与运行期产物目录（ruff 本来也只处理 Python，这里是显式声明）。
+extend-exclude = ["frontend", "data"]
+# pre-commit 会把暂存文件路径显式传给 ruff；没有它，exclude 对显式路径无效（会整仓重排）。
+force-exclude = true
+
+[tool.ruff.lint]
+# 基础规则集：E4/E7/E9（pycodestyle 明显问题）+ F（pyflakes，未使用导入等）+ I（导入排序）。
+# 不启用 E501（行长交给 formatter 管）与任何需要类型信息的规则，保持零外部依赖、秒级反馈。
+#
+# 注意：这里刻意 **不** 排除历史文件——`ruff check` 只报错不改风格，历史代码已经是干净的
+# （全量 check 通过），新文件更要在 check 覆盖内，否则新增未使用导入 / 未排序导入无人拦。
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.format]
+# --- ruff format 渐进迁移清单（P15-1）-----------------------------------------
+# 只对「格式化」生效，不影响 ruff check。
+# 下面是「先有代码」中尚未跑过 `ruff format` 的部分（多为文件尾空行、长表达式换行差异）。
+# 本任务的目标是「建立标准」，不是顺手重排半个仓库，因此先把它们排除出格式化；
+# 新写的文件（含新测试）照常强制格式化，`make lint` / CI 都会拦。
+# 清账方式：删掉一个条目 → `uv run ruff format <path>` → 提交格式化 diff。
+exclude = [
+    # docs/ 的 Markdown 代码块会被 `ruff format` 顺带重排（ruff ≥0.9 支持 md），
+    # 那属于文档内容、不在代码规范范围内。
+    "docs/**",
+    "app/**",
+    "tests/**",
+    "migrations/env.py",
+    "migrations/versions/p11_0001_initial_schema.py",
+    "scripts/migrate.py",
+    "scripts/render_mermaid.py",
+]
+
+[tool.uv.workspace]
+members = []
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
