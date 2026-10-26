@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from app.application.metrics.session_metrics import aggregate_session_metrics
 from app.presentation.dashboard import experiment_config
 from app.presentation.dependencies import COMMERCE_AUTH, get_container
+from app.presentation.ownership import authorize_session, owned_sessions
 
 
 def build_metrics_router() -> APIRouter:
@@ -43,6 +44,9 @@ def build_metrics_router() -> APIRouter:
         Raises:
             HTTPException: 指标存储未就绪返回 503。
         """
+        if session_id:
+            await authorize_session(request, session_id)
+        allowed = await owned_sessions(request)
         container = get_container(request)
         store = getattr(container, "metrics_store", None) if container is not None else None
         if store is None:
@@ -50,6 +54,11 @@ def build_metrics_router() -> APIRouter:
         bounded_limit = max(int(limit), 1)
         if session_id:
             rows = await store.list_by_session(session_id, limit=bounded_limit)
+        elif allowed is not None:
+            rows = []
+            for owned_id in sorted(allowed):
+                rows.extend(await store.list_by_session(owned_id, limit=bounded_limit))
+            rows = sorted(rows, key=lambda row: getattr(row, "created_at", ""))[-bounded_limit:]
         else:
             rows = await store.list_all(limit=bounded_limit)
         metrics = aggregate_session_metrics(rows)

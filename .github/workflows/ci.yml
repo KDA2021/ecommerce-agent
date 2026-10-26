@@ -1,11 +1,7 @@
 name: CI
 
-# P15-1：CI 只跑「不需要真实外部依赖」的检查，保证在 fork / 无密钥环境下也能全绿：
-#   - 不注入 LLM_API_KEY：所有 LLM 调用都被测试替身接管，缺 key 不会失败；
-#   - 不起 MySQL service：tests 里 MySQL 集成用例统一 `pytest.mark.skipif(not
-#     os.getenv("TEST_MYSQL_URL"))`，没有该变量时自动 skip（仍会跑单元 + 内存替身部分）。
-# 想让 MySQL 集成用例也进 CI，取消下面 services 段的注释并把 job env 里的
-# TEST_MYSQL_URL 打开即可，其余检查无需改动。
+# Fast checks stay independent of services. The isolated MySQL job must run
+# real database cases with no skips and never receives an external model key.
 
 on:
   push:
@@ -31,21 +27,6 @@ jobs:
       USERPROFILE: ${{ github.workspace }}/.ci-home
       TEMP: ${{ runner.temp }}
       TMP: ${{ runner.temp }}
-      # 可选：给 MySQL 集成用例用；留空则相关用例自动 skip（CI 不依赖数据库即可通过）。
-      # TEST_MYSQL_URL: mysql+asyncmy://ecommerce:ecommerce@127.0.0.1:3306/ecommerce?charset=utf8mb4
-    # 可选 MySQL service：
-    # services:
-    #   mysql:
-    #     image: mysql:8.4
-    #     env:
-    #       MYSQL_ROOT_PASSWORD: root
-    #       MYSQL_DATABASE: ecommerce
-    #       MYSQL_USER: ecommerce
-    #       MYSQL_PASSWORD: ecommerce
-    #     ports: ["3306:3306"]
-    #     options: >-
-    #       --health-cmd "mysqladmin ping -h 127.0.0.1 -uecommerce -pecommerce"
-    #       --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -92,6 +73,56 @@ jobs:
         # -q：CI 日志更干净；本地同样命令见 `make test`。
         run: uv run --no-sync pytest -q
 
+  mysql-integration:
+    name: backend (real MySQL integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-only
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: ecommerce_ci
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pci-root-only"
+          --health-interval 10s --health-timeout 5s --health-retries 15
+    env:
+      UV_CACHE_DIR: /tmp/uv-cache
+      # CI-only disposable service credentials. Migration tests create/drop an isolated DB.
+      TEST_MYSQL_URL: mysql+asyncmy://root:ci-root-only@127.0.0.1:3306/ecommerce_ci?charset=utf8mb4
+      TEST_MYSQL_ADMIN_URL: mysql+asyncmy://root:ci-root-only@127.0.0.1:3306/mysql?charset=utf8mb4
+      LLM_API_KEY: ""
+      RERANKER_ENABLED: "0"
+      SEMANTIC_CACHE_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.x"
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Real database tests
+        run: >-
+          uv run --no-sync pytest -q
+          tests/test_mysql_repositories.py tests/test_migrations.py
+          tests/test_checkpoint_handle.py tests/test_preference_store.py
+          tests/test_order_transactions.py tests/test_session_ownership_mysql.py
+          --junitxml=mysql-integration.xml
+      - name: Reject skipped or empty integration suites
+        if: always()
+        run: uv run --no-sync python scripts/check_integration_results.py mysql-integration.xml
+      - name: Upload database test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-integration-results
+          path: mysql-integration.xml
+
   frontend:
     name: frontend (npm build)
     runs-on: ubuntu-latest
@@ -113,7 +144,7 @@ jobs:
         run: npm ci
 
       - name: Unit tests
-        run: node --test "tests/*.test.mts"
+        run: npm test
 
       - name: Build
         run: npm run build

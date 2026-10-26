@@ -130,12 +130,12 @@ def _redis() -> RedisCache:
 
 
 def _create_tool(place, query, redis_cache):
-    tools = build_order_tools(place, query, None, redis_cache=redis_cache)
+    tools = build_order_tools(place, query, None, redis_cache=redis_cache, require_confirmation=False)
     return next(tool for tool in tools if tool.name == "create_order")
 
 
 def _expected_idempotency_key(buyer_id: str = "buyer-1", session_id: str = "s1") -> str:
-    return _idempotency_key(buyer_id, _ITEMS, session_id)
+    return _idempotency_key(buyer_id, _ITEMS, session_id, _ARGS["shipping_address"])
 
 
 async def _invoke(create, buyer_id: str = "buyer-1", session_id: str = "s1") -> dict:

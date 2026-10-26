@@ -1,3 +1,4 @@
+import { requestJson } from "./http.ts";
 /**
  * P10-3 偏好 chips：随请求提交的检索口径提示（结构化）。
  * 只提交用户显式勾选的槽位，未勾选的字段不出现在请求体里。
@@ -10,6 +11,7 @@ export interface PreferenceHint {
 }
 
 export interface IntentRequest {
+  client_request_id?: string;
   shopping_session_id: string;
   buyer_id: string;
   query: string;
@@ -18,18 +20,43 @@ export interface IntentRequest {
   preference_hint?: PreferenceHint;
 }
 
-export async function submitIntent(req: IntentRequest): Promise<string> {
-  const res = await fetch("/api/commerce/intents", {
+export interface IntentSubmission {
+  reply: string;
+  task_id?: string;
+  trace_id?: string;
+  status?: string;
+  shopping_session_id?: string;
+}
+export interface IntentTaskStatus {
+  task_id: string;
+  state: string;
+  found: boolean;
+  final_text?: string;
+  error?: string;
+}
+export const fetchIntentTask = (taskId: string): Promise<IntentTaskStatus> =>
+  requestJson(`/api/commerce/intents/${encodeURIComponent(taskId)}`);
+export interface AuthSession {
+  auth_required: boolean;
+  identity_mode: boolean;
+  buyer_id: string | null;
+}
+export const fetchAuthSession = (): Promise<AuthSession> => requestJson("/api/auth/session");
+export const login = (apiKey: string): Promise<AuthSession> => requestJson("/api/auth/session", {
+  method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({api_key: apiKey}),
+});
+export const logout = (): Promise<AuthSession> => requestJson("/api/auth/session", {method: "DELETE"});
+
+export async function submitIntent(req: IntentRequest): Promise<IntentSubmission> {
+  return requestJson<IntentSubmission>("/api/commerce/intents", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
   });
-  const body = await res.json();
-  return body.reply ?? "";
 }
 
 export function openEvents(sessionId: string): EventSource {
-  return new EventSource(`/api/commerce/events?shopping_session_id=${sessionId}`);
+  return new EventSource(`/api/commerce/events?shopping_session_id=${encodeURIComponent(sessionId)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -112,11 +139,7 @@ export interface SessionHistoryResponse {
  * @returns 会话列表；请求失败时抛错，由调用方回退 localStorage。
  */
 export async function fetchSessionList(): Promise<SessionSummary[]> {
-  const res = await fetch("/api/commerce/sessions");
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
+  const body = await requestJson<any>("/api/commerce/sessions");
   const list = Array.isArray(body?.sessions) ? (body.sessions as unknown[]) : [];
   return list
     .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
@@ -137,11 +160,7 @@ export async function fetchSessionList(): Promise<SessionSummary[]> {
  * @returns 后端历史；请求失败时抛错，由调用方回退本地记录。
  */
 export async function fetchSessionHistory(sessionId: string): Promise<SessionHistoryResponse> {
-  const res = await fetch(`/api/commerce/sessions/${encodeURIComponent(sessionId)}/history`);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
+  const body = await requestJson<any>(`/api/commerce/sessions/${encodeURIComponent(sessionId)}/history`);
   return {
     session_id: String(body?.session_id ?? sessionId),
     source: String(body?.source ?? "empty"),
@@ -182,12 +201,7 @@ export interface OrderSnapshot {
  * @returns 订单快照。
  */
 export async function fetchOrder(orderId: string): Promise<OrderSnapshot> {
-  const res = await fetch(`/api/commerce/orders/${encodeURIComponent(orderId)}`);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const detail = typeof body?.detail === "string" ? body.detail : `HTTP ${res.status}`;
-    throw new Error(detail);
-  }
+  const body = await requestJson<any>(`/api/commerce/orders/${encodeURIComponent(orderId)}`);
   return body as OrderSnapshot;
 }
 
@@ -212,16 +226,11 @@ export async function confirmOrder(
   token: string,
   action: "confirm" | "cancel",
 ): Promise<OrderConfirmResponse> {
-  const res = await fetch("/api/commerce/orders/confirm", {
+  const body = await requestJson<any>("/api/commerce/orders/confirm", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token, action }),
   });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const detail = typeof body?.detail === "string" ? body.detail : `HTTP ${res.status}`;
-    throw new Error(detail);
-  }
   return body as OrderConfirmResponse;
 }
 
@@ -233,16 +242,11 @@ export async function confirmOrder(
  * @returns 取消后的订单快照。
  */
 export async function cancelOrder(orderId: string, reason: string): Promise<OrderSnapshot> {
-  const res = await fetch(`/api/commerce/orders/${encodeURIComponent(orderId)}/cancel`, {
+  const body = await requestJson<any>(`/api/commerce/orders/${encodeURIComponent(orderId)}/cancel`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ reason }),
   });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const detail = typeof body?.detail === "string" ? body.detail : `HTTP ${res.status}`;
-    throw new Error(detail);
-  }
   return body as OrderSnapshot;
 }
 
@@ -289,16 +293,11 @@ export interface FeedbackResponse {
 }
 
 export async function submitFeedback(req: FeedbackRequest): Promise<FeedbackResponse> {
-  const res = await fetch("/api/commerce/feedback", {
+  const body = await requestJson<any>("/api/commerce/feedback", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
   });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const detail = typeof body?.detail === "string" ? body.detail : `HTTP ${res.status}`;
-    throw new Error(detail);
-  }
   return body as FeedbackResponse;
 }
 
@@ -359,11 +358,8 @@ export interface SessionMetricsAggregate {
 }
 
 export async function getDashboard(): Promise<DashboardMetrics> {
-  const res = await fetch("/api/commerce/dashboard");
-  if (!res.ok) {
-    throw new Error(`加载指标失败：HTTP ${res.status}`);
-  }
-  return (await res.json()) as DashboardMetrics;
+  const body = await requestJson<any>("/api/commerce/dashboard");
+  return body as DashboardMetrics;
 }
 
 /**
@@ -374,9 +370,6 @@ export async function getDashboard(): Promise<DashboardMetrics> {
  */
 export async function getSessionMetrics(sessionId?: string): Promise<SessionMetricsAggregate> {
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
-  const res = await fetch(`/api/commerce/metrics${query}`);
-  if (!res.ok) {
-    throw new Error(`加载成本指标失败：HTTP ${res.status}`);
-  }
-  return (await res.json()) as SessionMetricsAggregate;
+  const body = await requestJson<any>(`/api/commerce/metrics${query}`);
+  return body as SessionMetricsAggregate;
 }

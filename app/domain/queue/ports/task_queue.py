@@ -43,6 +43,7 @@ class IntentTask:
     # P11-4：worker 侧要还原的额外请求上下文（如 A/B 实验开关快照）。
     # 默认空 dict，保证既有构造调用不受影响。
     experiment_config: dict = field(default_factory=dict)
+    client_request_id: str = ""
 
     def to_dict(self) -> dict:
         """序列化成可入队结构。
@@ -60,6 +61,7 @@ class IntentTask:
             "enqueued_at": self.enqueued_at,
             "priority": self.priority,
             "experiment_config": dict(self.experiment_config or {}),
+            "client_request_id": self.client_request_id,
         }
 
     @staticmethod
@@ -95,6 +97,7 @@ class IntentTask:
             enqueued_at=raw.get("enqueued_at", ""),
             priority=priority,
             experiment_config=dict(config) if isinstance(config, dict) else {},
+            client_request_id=raw.get("client_request_id", ""),
         )
 
 

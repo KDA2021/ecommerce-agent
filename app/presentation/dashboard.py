@@ -85,7 +85,7 @@ def _iter_trace_files(trace_dir: Path):
     yield from sorted(trace_dir.glob("*.jsonl"))
 
 
-def summarize_traces(trace_dir: str | Path) -> dict:
+def summarize_traces(trace_dir: str | Path, session_ids: set[str] | None = None) -> dict:
     """扫描 trace JSONL，汇总会话 / 轮数 / TTFT / 缓存命中 / token 估算。
 
     Args:
@@ -95,7 +95,7 @@ def summarize_traces(trace_dir: str | Path) -> dict:
         原始聚合 dict（不含反馈与订单）。
     """
     trace_dir = Path(trace_dir)
-    session_ids: set[str] = set()
+    seen_session_ids: set[str] = set()
     completed_sessions: set[str] = set()
     turns = 0
     cache_hits = 0
@@ -106,7 +106,9 @@ def summarize_traces(trace_dir: str | Path) -> dict:
 
     for path in _iter_trace_files(trace_dir):
         session_id = path.stem
-        session_ids.add(session_id)
+        if session_ids is not None and session_id not in session_ids:
+            continue
+        seen_session_ids.add(session_id)
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -144,7 +146,7 @@ def summarize_traces(trace_dir: str | Path) -> dict:
 
     total_tokens = estimate_tokens(token_chars)
     return {
-        "sessions": len(session_ids),
+        "sessions": len(seen_session_ids),
         "completed_sessions": len(completed_sessions),
         "turns": turns,
         "cache_hits": cache_hits,
@@ -189,6 +191,7 @@ def aggregate_dashboard_metrics(
     *,
     order_success: int = 0,
     price_per_1k_tokens: float | None = None,
+    session_ids: set[str] | None = None,
 ) -> dict:
     """把 trace / 反馈 / 订单三路数据合成 Dashboard 指标（纯函数）。
 
@@ -201,7 +204,7 @@ def aggregate_dashboard_metrics(
     Returns:
         指标 dict。
     """
-    trace_stats = summarize_traces(trace_dir)
+    trace_stats = summarize_traces(trace_dir, session_ids=session_ids)
     feedback_stats = summarize_feedback(list(feedback_items or []))
 
     feedback_sessions = {
@@ -249,7 +252,7 @@ def aggregate_dashboard_metrics(
     return metrics
 
 
-async def count_successful_orders(engine) -> int:
+async def count_successful_orders(engine, buyer_id: str | None = None) -> int:
     """统计 ``orders.status == CONFIRMED`` 的订单数。
 
     Args:
@@ -261,12 +264,17 @@ async def count_successful_orders(engine) -> int:
     if engine is None:
         return 0
     sessions = async_sessionmaker(engine, expire_on_commit=False)
+    stmt = select(func.count()).select_from(OrderRow).where(
+        OrderRow.status == OrderStatus.CONFIRMED.value,
+    )
+    if buyer_id is not None:
+        from sqlalchemy import LargeBinary, cast
+
+        stmt = stmt.where(cast(OrderRow.buyer_id, LargeBinary) == buyer_id.encode("utf-8"))
     async with sessions() as db:
         return int(
             await db.scalar(
-                select(func.count()).select_from(OrderRow).where(
-                    OrderRow.status == OrderStatus.CONFIRMED.value,
-                ),
+                stmt,
             )
             or 0
         )
@@ -290,7 +298,7 @@ def _default_trace_dir(container) -> Path:
     return Path(data_dir) / "traces"
 
 
-async def collect_dashboard(container) -> dict:
+async def collect_dashboard(container, session_ids: set[str] | None = None, buyer_id: str | None = None) -> dict:
     """读取容器依赖并产出 Dashboard 指标。
 
     Args:
@@ -306,12 +314,14 @@ async def collect_dashboard(container) -> dict:
             feedback_items = await store.list_all()
         except Exception:  # noqa: BLE001 - 指标接口不能因反馈表异常整体 500
             feedback_items = []
+    if session_ids is not None:
+        feedback_items = [item for item in feedback_items if item.session_id in session_ids]
 
     order_success = 0
     engine = getattr(container, "engine", None)
     if engine is not None:
         try:
-            order_success = await count_successful_orders(engine)
+            order_success = await count_successful_orders(engine, buyer_id)
         except Exception:  # noqa: BLE001 - 指标接口 fail-safe
             order_success = 0
 
@@ -319,6 +329,7 @@ async def collect_dashboard(container) -> dict:
         _default_trace_dir(container),
         feedback_items,
         order_success=order_success,
+        session_ids=session_ids,
     )
     # P10-5：Dashboard 展示当前 A/B 实验配置（Container 快照优先，回退 settings）。
     metrics["experiment"] = experiment_config(container)

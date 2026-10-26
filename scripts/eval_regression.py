@@ -8,7 +8,7 @@
 3. 仍然显式把 ``container.semantic_cache`` 置为 ``None``，避免任何隐式缓存读取；
 4. 每条用例调一次 LLM 裁判，裁判同样由 ``build_chat_model`` 构造的 ChatOpenAI 担任，
    不依赖任何外部评测服务；
-5. 汇总写 ``data/eval-report.md``，并在标准输出打印总分。
+5. 业务后置条件独立核验；写唯一 run 目录的 Markdown/JSON，未达门禁时非零退出。
 
 用法::
 
@@ -24,10 +24,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
+import subprocess
 import sys
+import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -74,6 +78,163 @@ _BARE_SCORE = re.compile(r"^\s*([0-2])\s*分?\s*$")
 _REASON_PATTERN = re.compile(r"理由\s*[:：]\s*(.+)$", re.DOTALL)
 # 订单号形态，用于把回答里的订单号回数据库核验（区分真实下单与编造）。
 ORDER_ID_PATTERN = re.compile(r"GBX-\d{6}")
+
+
+def resolve_order_expectation(case: dict, products: list) -> dict:
+    """Use the catalog snapshot, never judge text or guessed prices, for expected totals."""
+    expected = dict(case.get("order_expectation") or {})
+    if expected.get("action") != "create":
+        return expected
+    prices = {sku.sku_id: sku.price for product in products for sku in product.skus}
+    total = 0
+    currencies = set()
+    for item in expected["items"]:
+        price = prices[item["sku_id"]]  # Missing seed data fails closed.
+        total += price.amount_in_minor_units * item["quantity"]
+        currencies.add(price.currency)
+    if len(currencies) != 1:
+        raise ValueError("Expected order must have exactly one currency")
+    expected.update(amount_minor=total, currency=currencies.pop(), amount_source="catalog_snapshot")
+    return expected
+
+
+def check_order_postconditions(expected, buyer_id, orders, before_ids, new_ids, mentions):
+    """Validate persisted business state independently of LLM scoring."""
+    failures = []
+    if expected.get("action") == "absent":
+        target = expected["order_id"]
+        if target not in orders or orders[target] is not None:
+            failures.append("expected order absence could not be verified")
+        if new_ids:
+            failures.append("unexpected new order during query")
+        if any(orders.get(order_id) is not None for order_id in mentions):
+            failures.append("reply references an existing order for missing-order query")
+        return failures
+    if expected.get("action") != "create":
+        return ["missing deterministic order expectation"]
+    if len(new_ids) != 1:
+        failures.append("creation requires exactly one new order in this case")
+    if set(mentions) != new_ids:
+        failures.append("reply order ids must match newly created order ids")
+    for order_id in set(mentions) | new_ids:
+        order = orders.get(order_id)
+        if order_id in before_ids:
+            failures.append("preexisting order cannot satisfy creation")
+        if order is None:
+            failures.append("persisted order missing")
+            continue
+        if order.buyer_id != buyer_id:
+            failures.append("buyer mismatch")
+        status = getattr(order.status, "value", order.status)
+        if status != expected["status"]:
+            failures.append("status mismatch")
+        actual_items = Counter((line.sku_id, line.quantity) for line in order.lines)
+        wanted_items = Counter((item["sku_id"], item["quantity"]) for item in expected["items"])
+        if actual_items != wanted_items:
+            failures.append("items SKU/quantity mismatch")
+        amount = order.total_amount()
+        if (amount.amount_in_minor_units, amount.currency) != (
+            expected["amount_minor"],
+            expected["currency"],
+        ):
+            failures.append("amount/currency mismatch")
+    return failures
+
+
+def finalize_result(result: dict) -> dict:
+    result = dict(result)
+    result["judge_score"] = result["score"]
+    if result.get("business_failures") or result.get("error"):
+        result["score"] = 0
+    result["task_passed"] = result["score"] == 2 and not result.get("parse_error", False)
+    return result
+
+
+def summarize_results(results: list[dict], min_score=0.8, min_pass_rate=0.8) -> dict:
+    if not 0 <= min_score <= 1 or not 0 <= min_pass_rate <= 1:
+        raise ValueError("Thresholds must be between 0 and 1")
+    normalized = sum(item["score"] for item in results) / (2 * len(results)) if results else 0
+    passed = sum(bool(item.get("task_passed", item["score"] == 2)) for item in results)
+    rate = passed / len(results) if results else 0
+    return {
+        "case_count": len(results),
+        "normalized_score": normalized,
+        "task_pass_rate": rate,
+        "min_score": min_score,
+        "min_pass_rate": min_pass_rate,
+        "error_count": sum(bool(item.get("error")) for item in results),
+        "exit_code": int(not results or normalized < min_score or rate < min_pass_rate),
+    }
+
+
+def source_fingerprint(root: Path = ROOT) -> str:
+    """Identify evaluated source bytes, including uncommitted changes, without secrets."""
+    root = Path(root)
+    paths = {
+        path
+        for directory in ("app", "scripts")
+        for path in (root / directory).rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+    paths.update(
+        root / relative
+        for relative in (
+            "eval/cases.yaml",
+            "uv.lock",
+            "pyproject.toml",
+            "frontend/package-lock.json",
+        )
+        if (root / relative).is_file()
+    )
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return "sha256:" + digest.hexdigest()
+
+
+def build_run_metadata(settings, cases, run_id, started_at) -> dict:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False
+    )
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=False
+    )
+    return {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "git_commit": commit.stdout.strip() or "unavailable",
+        "git_dirty": bool(dirty.stdout.strip()),
+        "source_fingerprint": source_fingerprint(),
+        "model": settings.llm_model,
+        "judge_model": settings.llm_model,
+        "routing": getattr(settings, "model_route_mode", "llm"),
+        "rerank": getattr(settings, "reranker_enabled", None),
+        "cache_configured": getattr(settings, "semantic_cache_enabled", None),
+        "cache_effective": False,
+        "queue_configured": getattr(settings, "queue_mode", "direct"),
+        "transport": "invoke_agent",
+        "case_ids": [case["id"] for case in cases],
+        "cost": {
+            "kind": "unavailable",
+            "reason": "invoke harness does not collect provider billing or token usage",
+        },
+    }
+
+
+async def snapshot_order_ids(container) -> dict[str, str]:
+    """Snapshot ids before/after a case; timestamp precision cannot prove new creation."""
+    from sqlalchemy import select
+
+    from app.infrastructure.persistence.tables import OrderRow
+
+    async with container.engine.connect() as connection:
+        rows = await connection.execute(select(OrderRow.order_id, OrderRow.buyer_id))
+        return dict(rows.all())
 
 
 def parse_judge_response(text: Any) -> int | None:
@@ -355,7 +516,9 @@ def _extract_reason(text: str) -> str:
     return text.strip().splitlines()[-1][:160]
 
 
-def render_report(settings: Any, results: list[dict]) -> str:
+def render_report(
+    settings: Any, results: list[dict], metadata: dict | None = None, summary: dict | None = None
+) -> str:
     """把逐条结果渲染成 Markdown 报告（纯函数，便于单测）。
 
     Args:
@@ -381,7 +544,7 @@ def render_report(settings: Any, results: list[dict]) -> str:
         "",
         "## 汇总",
         "",
-        "说明：`字面校验` 只是确定性参考（同义表述会漏判），最终以 LLM 裁判的语义评分为准。",
+        "说明：`字面校验` 只是确定性参考（同义表述会漏判），语义内容由 LLM 裁判评分；确定性业务后置条件失败会将本条得分置 0。",
         "",
         "| id | kind | 得分 | 字面校验 | 裁判理由 |",
         "| --- | --- | --- | --- | --- |",
@@ -395,6 +558,24 @@ def render_report(settings: Any, results: list[dict]) -> str:
             f"| {item['id']} | {item['kind']} | {score} | {_cell(literal)} | "
             f"{_cell(item['reason'])} |"
         )
+    if metadata:
+        lines += [
+            "",
+            "## 运行来源",
+            "",
+            "```json",
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            "```",
+        ]
+    if summary:
+        lines += [
+            "",
+            "## 门禁",
+            "",
+            "```json",
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            "```",
+        ]
     lines += ["", "## 逐条明细", ""]
     for item in results:
         lines += [
@@ -410,6 +591,10 @@ def render_report(settings: Any, results: list[dict]) -> str:
             f"- 裁判原始输出：{_cell(item['judge_raw'])}",
             f"- 该买家当前偏好：{item.get('preferences') or '无'}",
             f"- 订单号核验：{item.get('order_facts') or '无'}",
+            f"- 确定性业务失败：{item.get('business_failures') or '无'}",
+            f"- 业务预期：{item.get('order_expectation') or '无'}",
+            f"- 裁判原分：{item.get('judge_score', item['score'])}",
+            f"- Agent 延迟秒：{item.get('latency_seconds', '未测量')}",
         ]
         if item.get("error"):
             lines.append(f"- 执行异常：{_cell(item['error'])}")
@@ -495,6 +680,15 @@ async def run_case(
     from app.application.agents.main_graph import invoke_agent
     from app.infrastructure.context import ShoppingContext, ShoppingContextSnapshot
 
+    started_at = datetime.now(timezone.utc)
+    before_ids = {}
+    business_failures = []
+    expected = case.get("resolved_order_expectation", case.get("order_expectation", {}))
+    if case.get("kind") == "order":
+        try:
+            before_ids = await snapshot_order_ids(container)
+        except Exception as err:
+            business_failures.append(f"before snapshot failed: {type(err).__name__}: {err}")
     session_id = f"eval-{case['id']}-{run_tag}"
     reply = ""
     error = ""
@@ -506,6 +700,7 @@ async def run_case(
             currency="CNY",
         )
     )
+    agent_start = time.perf_counter()
     try:
         reply = await invoke_agent(container.agent, session_id, case["query"])
     except Exception as err:  # noqa: BLE001 - 单条用例失败不应中断整轮评测
@@ -514,6 +709,7 @@ async def run_case(
     finally:
         ShoppingContext.reset(token)
 
+    latency_seconds = time.perf_counter() - agent_start
     missing = [item for item in case["must_contain"] if item not in (reply or "")]
     forbidden = [item for item in case["must_not_contain"] if item in (reply or "")]
 
@@ -524,19 +720,44 @@ async def run_case(
     order_error = ""
     mentions = list(dict.fromkeys(ORDER_ID_PATTERN.findall(reply or "")))
     order_facts = ""
-    if mentions or case.get("kind") == "order":
-        for order_id in mentions:
+    new_ids = set()
+    orders = {}
+    if case.get("kind") == "order":
+        try:
+            after_ids = await snapshot_order_ids(container)
+            new_ids = set(after_ids) - set(before_ids)
+        except Exception as err:
+            business_failures.append(f"after snapshot failed: {type(err).__name__}: {err}")
+    verify_ids = set(mentions) | new_ids
+    if expected.get("action") == "absent":
+        verify_ids.add(expected["order_id"])
+    if verify_ids or case.get("kind") == "order":
+        for order_id in sorted(verify_ids):
             try:
                 order = await container.order_repo.find_by_id(order_id)
             except Exception as err:  # noqa: BLE001
                 order_error = f"{type(err).__name__}: {err}"
                 fabricated.append(order_id)
                 continue
+            orders[order_id] = order
             if order is None:
                 fabricated.append(order_id)
             else:
                 verified.append(order_id)
         order_facts = render_order_facts(verified, fabricated, order_error)
+    if case.get("kind") == "order":
+        if order_error:
+            business_failures.append(order_error)
+        try:
+            business_failures.extend(
+                check_order_postconditions(
+                    expected, case["buyer_id"], orders, set(before_ids), new_ids, mentions
+                )
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as err:
+            business_failures.append(f"invalid business expectation: {err}")
+    elif fabricated:
+        business_failures.append("reply contains fabricated order ids")
 
     try:
         judge_raw = await judge_case(
@@ -557,25 +778,31 @@ async def run_case(
     except Exception as err:  # noqa: BLE001
         preferences = [f"<读取失败 {type(err).__name__}>"]
 
-    return {
-        "id": case["id"],
-        "kind": case["kind"],
-        "source": case.get("source", "yaml"),
-        "buyer_id": case["buyer_id"],
-        "query": case["query"],
-        "must_contain": case["must_contain"],
-        "must_not_contain": case["must_not_contain"],
-        "reply": reply,
-        "error": error,
-        "missing": missing,
-        "forbidden": forbidden,
-        "score": score,
-        "parse_error": parse_error,
-        "judge_raw": judge_raw,
-        "reason": _extract_reason(judge_raw),
-        "preferences": preferences,
-        "order_facts": order_facts,
-    }
+    return finalize_result(
+        {
+            "id": case["id"],
+            "kind": case["kind"],
+            "source": case.get("source", "yaml"),
+            "buyer_id": case["buyer_id"],
+            "query": case["query"],
+            "must_contain": case["must_contain"],
+            "must_not_contain": case["must_not_contain"],
+            "reply": reply,
+            "error": error,
+            "missing": missing,
+            "forbidden": forbidden,
+            "score": score,
+            "parse_error": parse_error,
+            "judge_raw": judge_raw,
+            "reason": _extract_reason(judge_raw),
+            "preferences": preferences,
+            "order_facts": order_facts,
+            "business_failures": business_failures,
+            "order_expectation": expected,
+            "case_started_at": started_at.isoformat(),
+            "latency_seconds": round(latency_seconds, 6),
+        }
+    )
 
 
 async def run_eval(
@@ -583,13 +810,18 @@ async def run_eval(
     limit: int | None = None,
     report_path: Path | str | None = None,
     with_badcases: Path | str | None = None,
+    min_score: float = 0.8,
+    min_pass_rate: float = 0.8,
+    case_ids: list[str] | None = None,
+    buyer_suffix: str = "",
+    comparison_id: str | None = None,
 ) -> int:
     """执行整轮评测，返回进程退出码。
 
     Args:
         cases_path: 用例 YAML 路径。
         limit: 只跑前 N 条；None 表示全量。
-        report_path: 报告输出路径；None 使用默认 data/eval-report.md。
+        report_path: 报告输出路径；None 使用 data/eval-runs/<run_id>/eval-report.md。
         with_badcases: 非 None 时把该路径（或默认 data/badcases.jsonl）的
             点踩样本合并进评测用例。
 
@@ -613,22 +845,44 @@ async def run_eval(
         # 负数按 0 处理，避免切片语义意外取到倒数几条。
         cases = cases[: max(limit, 0)]
 
+    if case_ids:
+        selected = set(case_ids)
+        unknown = selected - {case["id"] for case in cases}
+        if unknown:
+            raise ValueError(f"Unknown case ids: {sorted(unknown)}")
+        cases = [case for case in cases if case["id"] in selected]
+    if buyer_suffix:
+        cases = [dict(case, buyer_id=case["buyer_id"] + buyer_suffix) for case in cases]
+    if not cases:
+        raise ValueError("No cases selected")
+    summarize_results([], min_score, min_pass_rate)  # Validate thresholds before external calls.
+    started_at = datetime.now(timezone.utc)
     settings = load_settings()
     judge = build_chat_model(settings)
     container = await build_container(settings)
     # 本脚本不走 server 路径，这里再显式禁用一次语义缓存，避免任何隐式读取。
     container.semantic_cache = None  # type: ignore[assignment]
-    run_tag = uuid.uuid4().hex[:8]
+    run_tag = uuid.uuid4().hex
+    metadata = build_run_metadata(settings, cases, run_tag, started_at)
+    metadata["comparison_id"] = comparison_id
 
     try:
-        catalog_facts = render_catalog_facts(await container.product_repo.list_all())
+        products = await container.product_repo.list_all()
+        catalog_facts = render_catalog_facts(products)
     except Exception as err:  # noqa: BLE001 - 商品库快照失败不阻断评测
+        products = []
         catalog_facts = f"（商品库读取失败：{type(err).__name__}）"
 
     results: list[dict] = []
     try:
         for case in cases:
             print(f"[eval] {case['id']} ...", flush=True)
+            case = dict(case)
+            if case["kind"] == "order":
+                try:
+                    case["resolved_order_expectation"] = resolve_order_expectation(case, products)
+                except (KeyError, ValueError, TypeError) as err:
+                    case["resolved_order_expectation"] = {"resolution_error": str(err)}
             result = await run_case(container, judge, case, run_tag, catalog_facts)
             results.append(result)
             print(
@@ -639,16 +893,29 @@ async def run_eval(
     finally:
         await container.close()
 
-    report = render_report(settings, results)
-    target = Path(report_path) if report_path else Path(settings.data_dir) / REPORT_NAME
+    summary = summarize_results(results, min_score, min_pass_rate)
+    report = render_report(settings, results, metadata, summary)
+    target = (
+        Path(report_path)
+        if report_path
+        else Path(settings.data_dir) / "eval-runs" / run_tag / REPORT_NAME
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(report, encoding="utf-8")
+    target.with_suffix(".json").write_text(
+        json.dumps(
+            {"metadata": metadata, "summary": summary, "results": results},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     total = sum(int(item["score"]) for item in results)
     max_total = 2 * len(results)
     print(f"总分：{total} / {max_total}（{len(results)} 条用例）")
     print(f"报告已写入：{target}")
-    return 0
+    return summary["exit_code"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -663,13 +930,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="P5 LLM-judge 评测回归")
     parser.add_argument("--cases", default=str(CASES_PATH), help="用例 YAML 路径")
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 条（冒烟用）")
-    parser.add_argument("--report", default=None, help="报告输出路径，默认 data/eval-report.md")
+    parser.add_argument(
+        "--report", default=None, help="报告输出路径，默认 data/eval-runs/<run_id>/eval-report.md"
+    )
     parser.add_argument(
         "--with-badcases",
         nargs="?",
         const=str(BADCASES_PATH),
         default=None,
         help="合并点踩 badcase 进评测；不带值用 data/badcases.jsonl，也可传自定义路径",
+    )
+    parser.add_argument(
+        "--min-score", type=float, default=0.8, help="Minimum normalized score [0, 1]"
+    )
+    parser.add_argument(
+        "--min-pass-rate", type=float, default=0.8, help="Minimum fraction of cases with score=2"
+    )
+    parser.add_argument("--case-ids", nargs="+", help="Fixed case IDs (preserves YAML order)")
+    parser.add_argument(
+        "--buyer-suffix", default="", help="Isolate synthetic buyers between comparison arms"
+    )
+    parser.add_argument(
+        "--comparison-id", help="Source nonce supplied by the controlled comparison runner"
     )
     args = parser.parse_args(argv)
     return asyncio.run(
@@ -678,6 +960,11 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             report_path=Path(args.report) if args.report else None,
             with_badcases=args.with_badcases,
+            min_score=args.min_score,
+            min_pass_rate=args.min_pass_rate,
+            case_ids=args.case_ids,
+            buyer_suffix=args.buyer_suffix,
+            comparison_id=args.comparison_id,
         )
     )
 

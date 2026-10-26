@@ -196,6 +196,9 @@ def create_app(container: Container | None = None, *, build_on_startup: bool = T
 
     # 挂载顺序与拆分前逐条注册的顺序一致，避免依赖路由匹配顺序的行为变化。
     # 鉴权 / 限流依赖由各 router 自己声明：业务入口鉴权，/health 不限流。
+    from app.presentation.routers.auth_session import build_auth_session_router
+
+    _mount_router(app, build_auth_session_router())
     _mount_router(app, build_events_router())
     _mount_router(app, build_intents_router())
     _mount_router(app, build_dashboard_router())

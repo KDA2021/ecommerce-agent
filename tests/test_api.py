@@ -103,7 +103,10 @@ def test_submit_intent_returns_fake_agent_reply():
     assert body["shopping_session_id"] == "s-test"
     assert body["reply"] == "测试回复"
     assert len(container.agent.calls) == 1
-    assert container.broker.events == [("s-test", "final.result", {"reply": "测试回复"})]
+    assert body["trace_id"]
+    assert container.broker.events == [("s-test", "final.result", {
+        "reply": "测试回复", "trace_id": body["trace_id"], "client_request_id": "",
+    })]
     assert container.semantic_cache.remembers == [
         ("buyer-1", "推荐一个旅行三件套", "测试回复", False, ""),
     ]

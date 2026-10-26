@@ -1,4 +1,4 @@
-import type { OrderCard, PreviewState } from "../orderPreview";
+import type { OrderCard, OrderOperation, PreviewState } from "../orderPreview";
 import type { ProductHit } from "../products";
 
 /** JSON 对象记录：SSE payload / 存储结构共用的宽松类型。 */
@@ -32,10 +32,12 @@ export type ChatOrderEvidence = ReturnType<typeof import("../orderPreview").extr
 
 /** 预览面板状态：pending=等用户点确认/取消；confirmed=token 已决议，等后端落库结果。 */
 export interface OrderPreviewState {
+  operation: OrderOperation;
   state: PreviewState;
   order_id: string;
   /** order.preview 的确认 token；真实握手必须带它 POST /commerce/orders/confirm。 */
   token: string;
+  error?: string;
   card: OrderCard;
   /** i18n key：渲染时按当前语言取文案，切换语言后提示不会停留在旧语言。 */
   hintKey: string;
@@ -63,7 +65,7 @@ export interface TimelineEntry {
  *   该轮 assistant 消息下方；重试同样重发该轮 query（同一 session id）。
  */
 export interface LastError {
-  kind: "request" | "sse" | "subagent";
+  kind: "request" | "sse" | "subagent" | "waiting";
   message?: string;
   query?: string;
   /** subagent 失败时原始标记行。 */

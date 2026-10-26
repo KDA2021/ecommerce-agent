@@ -241,6 +241,13 @@ class RedisStreamTaskQueue:
             kwargs["maxlen"] = int(self.max_stream_length)
             kwargs["approximate"] = True
         try:
+            # Persist the trusted producer's owner before exposing the task to consumers.
+            await client.hset(self.status_key(task.task_id), mapping={
+                "buyer_id": task.buyer_id,
+                "session_id": task.shopping_session_id,
+            })
+            if self.status_ttl_seconds > 0:
+                await client.expire(self.status_key(task.task_id), self.status_ttl_seconds)
             message_id = await client.xadd(self.stream_key, fields, **kwargs)
         except Exception as exc:
             raise QueueTaskError(f"任务入队失败：{exc}") from exc
@@ -449,6 +456,12 @@ class RedisStreamTaskQueue:
                 await self._client.expire(key, self.status_ttl_seconds)
         except Exception as exc:  # noqa: BLE001 - 状态是旁路，失败不能影响任务
             logger.warning("任务状态写入失败 task=%s err=%s", status.task_id, exc)
+
+    async def get_task_owner(self, task_id: str) -> str | None:
+        if self._client is None:
+            return None
+        raw = await self._client.hget(self.status_key(task_id), "buyer_id")
+        return _as_str(raw) if raw is not None else None
 
     async def get_status(self, task_id: str) -> Optional[TaskStatus]:
         """读任务状态；不存在 / 异常 / disabled 返回 ``None``。

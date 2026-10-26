@@ -1,28 +1,19 @@
 # -*- coding: utf-8 -*-
-"""下单确认管理器：真实阻塞 create_order，直到买家确认 / 取消 / 超时。
+"""交易确认握手与一次性授权，支持内存和 Redis 两种存储。
 
-背景（Task 2 修复）：上一版实现只在 ``tool.invoke`` 之后、``place.execute`` 之前
-展示预览，但 ``create_order`` 已经进入执行流程，用户的「确认」按钮并不能真正拦下
-下单动作。本模块把确认做成**进程内握手**：
-
-1. ``create_order`` 进入工具后先 ``create_preview(payload)`` 拿到 token，
-   通过 SSE 推送 ``order.preview``（带 token），然后 ``await wait(token, timeout)``
-   真正挂起；
-2. 前端 ``POST /commerce/orders/confirm {token, action}`` → ``resolve(token, action)``
-   唤醒挂起的协程；
-3. 只有 ``confirmed`` 才继续调用 ``PlaceOrderUseCase``；``cancelled`` / ``timeout``
-   直接返回取消结果，``place`` 完全不会被触碰。
-
-实现约束：
-- 纯进程内、无外部依赖（不加表 / 不加 Redis），与单进程部署匹配；
-- ``asyncio.Event`` 保证同一 token 的多个等待者共享一次决议；
-- 条目在决议 / 超时后清理，避免 token 表无界增长；
-- 所有方法都用 ``asyncio.Lock`` 保护，兼容并发确认与超时清理的竞争。
+下单与取消工具登记服务端预览，发布 ``order.preview`` 后等待买家操作。
+已鉴权确认接口调用 ``resolve``，工具再通过 ``consume`` 原子校验动作、
+买家、会话、参数摘要及有效期。仅 confirmed → consumed 的胜出者可继续执行。
+内存使用 asyncio.Lock；Redis 使用 WATCH/MULTI，供 web 与 worker 共享。
+工具退出时清理条目，Redis 还使用 TTL 回收进程异常留下的记录。
 """
 from __future__ import annotations
 
 import asyncio
 import copy
+import json
+import math
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -36,6 +27,7 @@ class ConfirmationStatus(str, Enum):
     CONFIRMED = "confirmed"    # 买家确认，可以真实下单
     CANCELLED = "cancelled"    # 买家取消，绝不能下单
     TIMEOUT = "timeout"        # 等待超时，按取消处理
+    CONSUMED = "consumed"      # 已领取执行权，不能重复执行
 
 
 #: ``wait`` 的合法返回集合，方便调用方 / 测试直接断言。
@@ -49,6 +41,29 @@ WAIT_OUTCOMES = frozenset(
 
 #: ``resolve`` 接受的用户动作。
 _RESOLVE_ACTIONS = {"confirm", "cancel"}
+
+_AUTHORIZATION_FIELDS = {"action", "buyer_id", "session_id", "arguments_sha256"}
+
+
+def _authorization_matches(payload: Any, expected: Any) -> bool:
+    """Malformed or expired grants fail closed, even after user confirmation."""
+    if not isinstance(expected, dict) or set(expected) != _AUTHORIZATION_FIELDS:
+        return False
+    if any(not isinstance(value, str) or not value for value in expected.values()):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    authorization = payload.get("_authorization")
+    if not isinstance(authorization, dict):
+        return False
+    if any(authorization.get(field) != expected[field] for field in _AUTHORIZATION_FIELDS):
+        return False
+    expires_at = authorization.get("expires_at")
+    return (
+        type(expires_at) in (int, float)
+        and math.isfinite(expires_at)
+        and expires_at > time.time()
+    )
 
 
 @dataclass
@@ -91,6 +106,8 @@ class OrderConfirmationManager:
         """
         resolved_token = token or uuid4().hex
         async with self._lock:
+            if resolved_token in self._entries:
+                raise ValueError(f"confirmation token already exists: {resolved_token}")
             entry = _PendingPreview(
                 token=resolved_token,
                 payload=copy.deepcopy(payload) if isinstance(payload, dict) else payload,
@@ -98,6 +115,17 @@ class OrderConfirmationManager:
             )
             self._entries[resolved_token] = entry
         return resolved_token
+
+    async def consume(self, token: str, expected: dict) -> bool:
+        """Atomically claim one confirmed, unexpired action grant exactly once."""
+        async with self._lock:
+            entry = self._entries.get(token)
+            if entry is None or entry.status is not ConfirmationStatus.CONFIRMED:
+                return False
+            if not _authorization_matches(entry.payload, expected):
+                return False
+            entry.status = ConfirmationStatus.CONSUMED
+            return True
 
     # ------------------------------------------------------------------ #
     # 决议侧：REST /commerce/orders/confirm
@@ -152,6 +180,8 @@ class OrderConfirmationManager:
             entry = self._entries.get(token)
             if entry is None:
                 return ConfirmationStatus.TIMEOUT.value
+            if entry.status is ConfirmationStatus.CONSUMED:
+                return ConfirmationStatus.TIMEOUT.value
             if entry.status is not ConfirmationStatus.PENDING:
                 return entry.status.value
             event = entry.resolution_event
@@ -173,6 +203,8 @@ class OrderConfirmationManager:
             if entry is None:
                 return ConfirmationStatus.TIMEOUT.value
             outcome = entry.status.value
+            if entry.status is ConfirmationStatus.CONSUMED:
+                return ConfirmationStatus.TIMEOUT.value
             if entry.status is ConfirmationStatus.PENDING:
                 # 事件被 set 但状态未落库（不应发生）：按超时兜底。
                 outcome = ConfirmationStatus.TIMEOUT.value
@@ -235,3 +267,127 @@ class OrderConfirmationManager:
                 for token, entry in self._entries.items()
                 if entry.status is ConfirmationStatus.PENDING
             ]
+
+
+class RedisOrderConfirmationManager:
+    """Shared confirmation state for web/worker processes in queue deployments.
+
+    The first decision wins through WATCH/MULTI. Expiry bounds abandoned previews;
+    a Redis error propagates instead of authorizing an unconfirmed order.
+    """
+
+    def __init__(self, client, ttl_seconds: int = 600):
+        self._client = client
+        self._ttl = max(1, int(ttl_seconds))
+
+    def _key(self, token: str) -> str:
+        return "order-confirmation:v1:" + token
+
+    async def create_preview(self, payload: dict, *, token: str | None = None) -> str:
+        from redis.exceptions import WatchError
+
+        token = token or uuid4().hex
+        key = self._key(token)
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for _ in range(8):
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    if await pipe.exists(key):
+                        raise ValueError(f"confirmation token already exists: {token}")
+                    pipe.multi()
+                    pipe.hset(key, mapping={"status": "pending", "payload": serialized})
+                    pipe.expire(key, self._ttl)
+                    await pipe.execute()
+                    return token
+                except WatchError:
+                    continue
+        raise RuntimeError("确认状态正被并发更新，请重试")
+
+    async def consume(self, token: str, expected: dict) -> bool:
+        """Claim a shared grant under WATCH so only one process can execute it."""
+        from redis.exceptions import WatchError
+
+        key = self._key(token)
+        for _ in range(8):
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    status, serialized = await pipe.hmget(key, "status", "payload")
+                    if status not in ("confirmed", b"confirmed") or serialized is None:
+                        return False
+                    try:
+                        payload = json.loads(serialized)
+                    except (ValueError, TypeError, UnicodeError):
+                        return False
+                    if not _authorization_matches(payload, expected):
+                        return False
+                    pipe.multi()
+                    pipe.hset(key, "status", "consumed")
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        return False
+
+    async def resolve(self, token: str, action: str) -> str:
+        if action not in _RESOLVE_ACTIONS:
+            raise ValueError("只支持 confirm / cancel")
+        return await self._decide(token, "confirmed" if action == "confirm" else "cancelled")
+
+    async def _decide(self, token: str, decision: str) -> str:
+        from redis.exceptions import WatchError
+
+        key = self._key(token)
+        for _ in range(8):
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    status = await pipe.hget(key, "status")
+                    if status is None:
+                        return "unknown"
+                    if isinstance(status, bytes):
+                        status = status.decode()
+                    if status != "pending":
+                        return status
+                    pipe.multi()
+                    pipe.hset(key, "status", decision)
+                    await pipe.execute()
+                    return decision
+                except WatchError:
+                    continue
+        raise RuntimeError("确认状态正被并发更新，请重试")
+
+    async def wait(self, token: str, timeout: float) -> str:
+        deadline = asyncio.get_running_loop().time() + max(0, timeout)
+        while asyncio.get_running_loop().time() < deadline:
+            status = await self.status(token)
+            if status in ("confirmed", "cancelled"):
+                return status
+            if status == "consumed":
+                return "timeout"
+            if status == "unknown":
+                return "timeout"
+            await asyncio.sleep(min(0.1, max(0, deadline - asyncio.get_running_loop().time())))
+        decided = await self._decide(token, "timeout")
+        return "timeout" if decided in ("unknown", "consumed") else decided
+
+    async def clear(self, token: str) -> bool:
+        return bool(await self._client.delete(self._key(token)))
+
+    async def status(self, token: str) -> str:
+        result = await self._client.hget(self._key(token), "status")
+        return result.decode() if isinstance(result, bytes) else result or "unknown"
+
+    async def preview_payload(self, token: str) -> dict | None:
+        result = await self._client.hget(self._key(token), "payload")
+        return json.loads(result) if result is not None else None
+
+    async def pending_tokens(self) -> list[str]:
+        tokens = []
+        async for key in self._client.scan_iter(match="order-confirmation:v1:*"):
+            key = key.decode() if isinstance(key, bytes) else key
+            token = key.rsplit(":", 1)[-1]
+            if await self.status(token) == "pending":
+                tokens.append(token)
+        return tokens

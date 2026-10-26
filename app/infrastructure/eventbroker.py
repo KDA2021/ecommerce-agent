@@ -107,6 +107,15 @@ class EventBroker:
         """
         # P10-5：把事件同步给当前请求的成本采集器（未设置时 no-op）。
         record_metric_event(event_type, payload)
+        snapshot = ShoppingContext.current()
+        if isinstance(payload, dict) and snapshot is not None:
+            correlation = {
+                key: getattr(snapshot, key, "")
+                for key in ("task_id", "client_request_id")
+                if getattr(snapshot, key, "") and key not in payload
+            }
+            if correlation:
+                payload = {**payload, **correlation}
         if isinstance(payload, dict) and "trace_id" not in payload:
             trace_id = ShoppingContext.current_trace_id()
             if trace_id:

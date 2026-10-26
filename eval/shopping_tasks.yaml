@@ -1,0 +1,166 @@
+# Authored synthetic shopping scenarios, fixed before any live benchmark run.
+# All sets use build_seed_products(), primary-SKU prices and explicit ships_to.
+# This is a routing-mode comparison on the same graph/tools, not an architecture benchmark.
+# Only affirmative recommendations count; rejected or infeasible comparisons do not.
+# Every buyer is isolated per case/arm/repetition; fresh_session preserves only that buyer.
+# Budget eligibility means primary-SKU merchandise price, excluding shipping/tax.
+version: 1
+cases:
+  - id: shopping-travel-set-budget
+    category: simple_budget
+    description: "中国配送、200 CNY 内的旅行三件套；全部合格项为 Nomadica 189、Voyager 139。毛巾三件装不属于颈枕眼罩旅行套装。"
+    turns:
+      - query: "帮我找个含颈枕、眼罩的旅行三件套，寄中国，商品标价200元以内，不含运税。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1001, P1011]
+          min_recommendations: 1
+
+  - id: shopping-charger-japan
+    category: multiple_constraints
+    description: "寄日本、170 CNY 内的充电器全部为 30W 89、65W 159；100W 299 超预算，转换插头不是充电器。"
+    turns:
+      - query: "我要寄到日本的手机快充充电器，商品标价170元以内，不含运税，不是转换插头，推荐一下。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1005, P1024]
+          min_recommendations: 1
+
+  - id: shopping-compare-chargers
+    category: comparison
+    description: "明确比较 VoltTrek 30W 与 65W；两组均须出现，价格按主 SKU 89/159 CNY。"
+    turns:
+      - query: "帮我对比VoltTrek的30W迷你充电器和65W旅行充电器，分别多少钱、适合什么用法？只比较这两款。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1024, P1005]
+          min_recommendations: 2
+          required_groups: [[P1024], [P1005]]
+          required_price_ids: [P1024, P1005]
+          require_comparison_reasoning: true
+
+  - id: shopping-reference-first
+    category: followup_reference
+    description: "第一轮150 CNY内的颈枕眼罩三件套只有Voyager 139；第二轮要求把刚才第一款与Nomadica 189比较，二者都合格。"
+    turns:
+      - query: "推荐一款商品标价150元以内、寄中国、含颈枕和眼罩的旅行三件套，不含运税。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1011]
+          min_recommendations: 1
+      - query: "刚才第一款和Nomadica旅行三件套有什么差别？现在商品标价预算200元，不含运税，两款都帮我比较一下。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1011, P1001]
+          min_recommendations: 2
+          required_groups: [[P1011], [P1001]]
+          required_price_ids: [P1011, P1001]
+          require_comparison_reasoning: true
+
+  - id: shopping-revise-budget
+    category: changed_budget
+    description: "100 CNY 内只有30W 89；预算提高到180且明确至少65W后，只有65W 159合格，100W 299不合格。"
+    turns:
+      - query: "给我推荐中国能收货、商品标价100元以内的VoltTrek充电器，不含运税。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1024]
+          min_recommendations: 1
+      - query: "商品标价预算提高到180元，仍不含运税，功率要至少65W，重新推荐。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1005]
+          min_recommendations: 1
+          must_not_recommend_ids: [P1024, P1025]
+
+  - id: shopping-change-country
+    category: changed_country
+    description: "中国150 CNY内背包为Wanderlite 129与BudgetPack 39；两者都不寄美国，唯一寄美国背包DryPack 219超预算。"
+    turns:
+      - query: "推荐一个寄中国、商品标价150元以内的双肩背包，不含运税。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1003, P1049]
+          min_recommendations: 1
+      - query: "收货地改成美国了，还是商品标价150元以内的双肩背包，不含运税，帮我重新筛。"
+        expectation:
+          mode: no_match
+          eligible_ids: []
+          must_not_recommend_ids: [P1003, P1049, P1018]
+
+  - id: shopping-remember-material
+    category: persistent_preference
+    description: "新会话仍避开塑料：20寸箱只有TrailOx 899（PC箱体）与GlideCase 399（PC硬壳），均不满足避塑料。DB必须有结构化dislike/material/塑料。"
+    turns:
+      - query: "请记住我的长期偏好：不喜欢塑料材质，以后购物推荐都避开塑料。"
+        expectation:
+          mode: ack
+          eligible_ids: []
+          preference: {kind: dislike, attribute: material, value: 塑料}
+      - query: "推荐一个寄中国、商品标价1000元以内的20寸登机行李箱，不含运税。"
+        fresh_session: true
+        expectation:
+          mode: no_match
+          eligible_ids: []
+          must_not_recommend_ids: [P1002, P1016]
+          preference: {kind: dislike, attribute: material, value: 塑料}
+
+  - id: shopping-forget-material
+    category: preference_revision
+    description: "先记住再明确删除避塑料偏好；删除后新会话中国500 CNY内20寸登机箱只有GlideCase 399。每轮检查DB偏好存在/不存在。"
+    turns:
+      - query: "记住，我不喜欢塑料材质，今后推荐请避开。"
+        expectation:
+          mode: ack
+          eligible_ids: []
+          preference: {kind: dislike, attribute: material, value: 塑料}
+      - query: "忘掉我不喜欢塑料材质这条偏好，以后塑料材质也可以推荐。"
+        expectation:
+          mode: ack
+          eligible_ids: []
+          forbidden_preferences: [{kind: dislike, attribute: material, value: 塑料}]
+      - query: "推荐一个寄中国、商品标价500元以内的20寸登机箱，不含运税。"
+        fresh_session: true
+        expectation:
+          mode: recommend
+          eligible_ids: [P1016]
+          min_recommendations: 1
+          forbidden_preferences: [{kind: dislike, attribute: material, value: 塑料}]
+
+  - id: shopping-impossible-budget
+    category: impossible_budget
+    description: "20 CNY内没有背包；最便宜BudgetPack 39。应如实无匹配，不能把超预算商品当成满足条件的推荐。"
+    turns:
+      - query: "商品标价预算只有20元，不含运税，想买个寄中国的双肩背包，严格不能超预算，有合适的吗？"
+        expectation:
+          mode: no_match
+          eligible_ids: []
+
+  - id: shopping-nonexistent-product
+    category: honest_no_match
+    description: "60 SPU中没有诺基亚3310手机壳；不可把三脚架、读卡器、数据线当成匹配手机壳。"
+    turns:
+      - query: "帮我找一个诺基亚3310专用手机壳，要寄中国；只要这个型号的手机壳。"
+        expectation:
+          mode: no_match
+          eligible_ids: []
+
+  - id: shopping-clarify-need
+    category: underspecified
+    description: "只说要买旅行用品，未给具体品类、预算和目的；期望先提出有内容的需求澄清，不指定唯一措辞。"
+    turns:
+      - query: "我想买点旅行用品，你先帮我确定需求吧。"
+        expectation:
+          mode: clarify
+          eligible_ids: []
+
+  - id: shopping-usd-headphones
+    category: currency_constraint
+    description: "寄美国、200 USD内、主动降噪耳机只有SilentBuds 189 USD；AeroHush Pro 219 USD超预算，Lite 299 CNY仅通话降噪，不擅自换汇。"
+    turns:
+      - query: "推荐寄美国的主动降噪耳机，商品标价200美元以内，不含运税，价格用商品原币种，不要自行换汇。"
+        expectation:
+          mode: recommend
+          eligible_ids: [P1023]
+          min_recommendations: 1
+          must_not_recommend_ids: [P1004, P1022]

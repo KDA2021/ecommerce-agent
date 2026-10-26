@@ -143,6 +143,8 @@ async def _process_task(
         locale=task.locale,
         currency=task.currency,
         trace_id=trace_id,
+        task_id=task.task_id,
+        client_request_id=task.client_request_id,
     )
     context_token = ShoppingContext.set(snapshot)
     metrics_token = set_collector(SessionMetricsCollector())
@@ -166,14 +168,25 @@ async def _process_task(
                     session_id,
                     query,
                     broker,
+                    data_policy=getattr(container, "data_policy", None),
+                    output_guard=lambda text: _guard_completion(container, trace_id, text),
                 )
             else:
-                reply = await invoke_agent(container.agent, session_id, query)
+                reply = await invoke_agent(
+                    container.agent,
+                    session_id,
+                    query,
+                    data_policy=getattr(container, "data_policy", None),
+                )
         reply = await _guard_completion(container, trace_id, reply)
     except Exception as err:  # noqa: BLE001 - 单条任务失败不能让 worker 退出
-        logger.exception("任务失败 task=%s", trace_id)
-        _publish(broker, session_id, "error", {"task_id": trace_id, "message": str(err)})
-        status = TaskStatus(task_id=trace_id, state="failed", error=str(err))
+        from app.application.data_policy import DataPolicy
+
+        policy = getattr(container, "data_policy", None) or DataPolicy()
+        safe_error = policy.sanitize_output(str(err))
+        logger.error("任务失败 task=%s error=%s", trace_id, safe_error)
+        _publish(broker, session_id, "error", {"task_id": trace_id, "message": safe_error})
+        status = TaskStatus(task_id=trace_id, state="failed", error=safe_error)
     else:
         _publish(broker, session_id, "final.result", {"task_id": trace_id, "reply": reply})
         status = TaskStatus(task_id=trace_id, state="done", final_text=reply)
@@ -225,7 +238,10 @@ async def _guard_completion(container: Container, trace_id: str, reply: str) -> 
                 verified = list(await getter(trace_id))
         except Exception:  # noqa: BLE001 - 证据读取失败 fail closed
             verified = []
-    return CompletionGuard.guard(reply, verified)
+    from app.application.data_policy import DataPolicy
+
+    policy = getattr(container, "data_policy", None) or DataPolicy()
+    return policy.sanitize_output(CompletionGuard.guard(reply, verified))
 
 
 async def _record_metrics(

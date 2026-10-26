@@ -90,6 +90,11 @@ cases:
     kind: order
     query: "确认下单：Nomadica 旅行三件套 军绿色（P1001-S1）1 件，收货地址浙江省杭州市西湖区某路 1 号，收件人张三，电话 13800000000。请直接创建订单，不用再和我确认。"
     buyer_id: eval-buyer-order
+    order_expectation:
+      action: create
+      items: [{sku_id: P1001-S1, quantity: 1}]
+      status: CONFIRMED
+      # Amount is resolved from the canonical persisted catalog snapshot before the run.
     must_contain: ["GBX"]
     must_not_contain: []
 
@@ -97,6 +102,7 @@ cases:
     kind: order
     query: "帮我查一下订单 GBX-999999 现在是什么状态"
     buyer_id: eval-buyer-order
+    order_expectation: {action: absent, order_id: GBX-999999}
     must_contain: ["不存在"]
     must_not_contain: ["已发货", "已签收"]
 

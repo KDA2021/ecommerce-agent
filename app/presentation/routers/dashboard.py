@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
+from app.presentation.auth import principal
 from app.presentation.dashboard import collect_dashboard
 from app.presentation.dependencies import COMMERCE_AUTH, get_container
+from app.presentation.ownership import owned_sessions
 
 
 def build_dashboard_router() -> APIRouter:
@@ -30,6 +32,8 @@ def build_dashboard_router() -> APIRouter:
         Returns:
             指标 dict。
         """
-        return await collect_dashboard(get_container(request))
+        user = principal(request)
+        return await collect_dashboard(get_container(request), session_ids=await owned_sessions(request),
+                                       buyer_id=user.buyer_id if user else None)
 
     return router

@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from app.presentation.dependencies import COMMERCE_AUTH, get_container
+from app.presentation.ownership import authorize_session, owned_sessions
 from app.presentation.sessions import _trace_dir, collect_thread_history, summarize_trace_sessions
 
 
@@ -32,6 +33,9 @@ def build_sessions_router() -> APIRouter:
         """
         container = get_container(request)
         sessions = summarize_trace_sessions(_trace_dir(container))
+        allowed = await owned_sessions(request)
+        if allowed is not None:
+            sessions = [item for item in sessions if item.get("session_id") in allowed]
         return {"sessions": sessions, "count": len(sessions)}
 
     @router.get("/commerce/sessions/{session_id}/history", dependencies=COMMERCE_AUTH)
@@ -45,6 +49,7 @@ def build_sessions_router() -> APIRouter:
         Returns:
             ``{"session_id", "source", "messages"}``。
         """
+        await authorize_session(request, session_id)
         container = get_container(request)
         source, messages = await collect_thread_history(container, session_id)
         return {"session_id": session_id, "source": source, "messages": messages}

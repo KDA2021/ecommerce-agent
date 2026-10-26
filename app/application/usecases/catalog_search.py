@@ -32,6 +32,7 @@ from app.application.usecases.recommendation_reasons import (
     build_reasons,
     preference_matches,
 )
+from app.domain.buyer.preference_facts import safe_preference
 from app.domain.catalog.exchange_rate import ExchangeRateTable
 from app.domain.catalog.ports.product_repository import ProductRepository
 from app.domain.catalog.ports.retrieval_ports import (
@@ -279,7 +280,10 @@ class CatalogSearchUseCase:
         except Exception as err:  # noqa: BLE001 —— 偏好读取失败只影响理由，不应把检索搞挂
             logger.warning("读取买家偏好失败，跳过偏好理由：%s", err)
             return spec
-        statements = tuple(p.statement for p in preferences if getattr(p, "statement", ""))
+        # Recommendation reasons are model-visible too; they must use the same
+        # canonical business boundary as preference hints and cache rendering.
+        safe = (safe_preference(preference) for preference in preferences)
+        statements = tuple(p.statement for p in safe if p is not None)
         if not statements:
             return spec
         return replace(spec, preference_statements=statements)

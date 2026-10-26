@@ -208,11 +208,11 @@ async def test_upgrade_head_on_empty_database(temp_database_url):
     tables = await _table_names(temp_database_url)
     assert EXPECTED_TABLES <= tables
     assert "alembic_version" in tables
-    assert await _alembic_version(temp_database_url) == "p11_0001"
+    assert await _alembic_version(temp_database_url) == "p17_0001"
 
     # 再跑一次应幂等（不抛异常、版本不变）。
     await asyncio.to_thread(run_migrations, temp_database_url, "head")
-    assert await _alembic_version(temp_database_url) == "p11_0001"
+    assert await _alembic_version(temp_database_url) == "p17_0001"
 
 
 async def test_downgrade_to_base_drops_all_tables(temp_database_url):
@@ -266,5 +266,5 @@ async def test_auto_stamp_compat_with_bootstrap_schema(temp_database_url):
         temp_database_url,
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
-    assert await _alembic_version(temp_database_url) == "p11_0001"
+    assert await _alembic_version(temp_database_url) == "p17_0001"
     assert EXPECTED_TABLES <= await _table_names(temp_database_url)

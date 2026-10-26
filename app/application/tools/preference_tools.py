@@ -1,93 +1,107 @@
-# -*- coding: utf-8 -*-
-"""偏好记忆工具：remember_preference_tool / forget_preference_tool。"""
+"""Preference tools persist validated business facts under the current server actor."""
+from datetime import datetime, timezone
+
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr
 
 from app.domain.buyer.preference import BuyerPreference, PreferenceStore
+from app.domain.buyer.preference_facts import normalize_preference, safe_preference
 from app.infrastructure.context import ShoppingContext
 
 
 class RememberPreferenceArgs(BaseModel):
-    """remember_preference_tool 入参。"""
+    """Explicit slots are preferred; recognized historical phrases remain supported."""
 
+    model_config = ConfigDict(extra="forbid")
     kind: str = Field(description="like 或 dislike")
-    statement: str = Field(description="一句话偏好陈述，如“不要塑料材质”")
+    statement: str = Field(default="", description="支持的偏好短句，如不要塑料材质、喜欢小众设计")
+    attribute: str | None = Field(default=None, description="budget_max/material/category/brand/color/style/ship_to")
+    value: StrictStr | StrictInt | StrictFloat | None = Field(default=None, description="商品属性值；预算为正数，其他为支持的商品属性")
+    currency: str | None = Field(default=None, description="仅 budget_max 必须提供，如 CNY/USD/EUR")
 
 
 class ForgetPreferenceArgs(BaseModel):
-    """forget_preference_tool 入参。"""
+    """Deletion accepts exact old statements, including quarantined records."""
 
-    statement: str = Field(description="要删除的偏好原文，必须完全一致")
+    model_config = ConfigDict(extra="forbid")
+    statement: str = Field(max_length=255, description="要删除的偏好原文，必须完全一致")
+
+
+def _actor():
+    snapshot = ShoppingContext.current()
+    if not snapshot or not snapshot.buyer_id.strip() or not snapshot.shopping_session_id.strip():
+        return None
+    if (
+        snapshot.buyer_id != snapshot.buyer_id.strip()
+        or snapshot.shopping_session_id != snapshot.shopping_session_id.strip()
+    ):
+        return None
+    if snapshot.buyer_id == "anonymous" or snapshot.shopping_session_id == "anonymous":
+        return None
+    return snapshot
 
 
 def build_preference_tools(store: PreferenceStore, broker=None):
-    """构建偏好写入 / 撤回两个 LangChain 工具。
-
-    Args:
-        store: 偏好存储端口。
-        broker: 可选事件总线。
-
-    Returns:
-        两个 ``StructuredTool`` 的列表。
-    """
-    async def remember_preference_tool(kind: str, statement: str) -> dict:
-        """写入买家长期偏好（同 buyer 同 statement 幂等去重）。
-
-        Args:
-            kind: ``like`` 或 ``dislike``。
-            statement: 偏好原文。
-
-        Returns:
-            ``{'saved': ...}``，校验失败时为 ``{'error': ...}``。
-        """
-        session_id = ShoppingContext.current_session_id()
-        snapshot = ShoppingContext.current()
-        buyer_id = snapshot.buyer_id if snapshot else "anonymous"
-        if broker:
-            broker.publish(session_id, "tool.invoke", {"tool": "remember_preference_tool", "args": {"kind": kind, "statement": statement}})
+    """Build remember/forget without exposing identity or provenance as tool args."""
+    async def remember_preference_tool(
+        kind: str, statement: str = "", attribute: str | None = None,
+        value: str | int | float | None = None, currency: str | None = None,
+    ) -> dict:
+        snapshot = _actor()
+        if snapshot is None:
+            return {"error": "缺少买家或会话上下文"}
         try:
-            await store.append(BuyerPreference(buyer_id=buyer_id, kind=kind, statement=statement))
+            attribute, value, currency, canonical = normalize_preference(
+                kind, statement, attribute=attribute, value=value, currency=currency,
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            preference = BuyerPreference(
+                buyer_id=snapshot.buyer_id, kind=kind, statement=canonical,
+                attribute=attribute, value=value, currency=currency,
+                source_session_id=snapshot.shopping_session_id, created_at=now, updated_at=now,
+            )
+            await store.append(preference)
         except ValueError as err:
-            if broker:
-                broker.publish(session_id, "tool.result", {"tool": "remember_preference_tool", "error": str(err)})
             return {"error": str(err)}
         if broker:
-            broker.publish(session_id, "tool.result", {"tool": "remember_preference_tool", "saved": statement})
-        return {"saved": f"[{kind}] {statement}"}
+            broker.publish(snapshot.shopping_session_id, "tool.result", {
+                "tool": "remember_preference_tool", "saved": canonical,
+            })
+        return {"saved": f"[{kind}] {canonical}"}
 
     async def forget_preference_tool(statement: str) -> dict:
-        """按原文精确撤回偏好，并返回剩余偏好。
-
-        Args:
-            statement: 要删除的偏好原文。
-
-        Returns:
-            ``{'deleted': bool, 'remaining': [...]}``。
-        """
-        session_id = ShoppingContext.current_session_id()
-        snapshot = ShoppingContext.current()
-        buyer_id = snapshot.buyer_id if snapshot else "anonymous"
-        deleted = await store.delete(buyer_id, statement)
-        remaining = await store.list_by_buyer(buyer_id)
+        snapshot = _actor()
+        if snapshot is None:
+            return {"error": "缺少买家或会话上下文"}
+        deleted = await store.delete(snapshot.buyer_id, statement)
+        # A recognized historical alias may render as canonical business text.
+        # Resolve only exact canonical equality back to its original statement;
+        # retain exact deletion for quarantined rows and never use fuzzy matching.
+        existing = await store.list_by_buyer(snapshot.buyer_id)
+        for original in existing:
+            safe = safe_preference(original)
+            if (
+                original.buyer_id == snapshot.buyer_id and safe is not None
+                and safe.statement == statement and original.statement != statement
+            ):
+                deleted = await store.delete(snapshot.buyer_id, original.statement) or deleted
+        remaining = [safe_preference(p) for p in await store.list_by_buyer(snapshot.buyer_id)]
+        rendered = [f"[{p.kind}] {p.statement}" for p in remaining if p is not None]
         if broker:
-            broker.publish(session_id, "tool.result", {
-                "tool": "forget_preference_tool",
-                "deleted": deleted,
-                "remaining": [f"[{p.kind}] {p.statement}" for p in remaining],
+            broker.publish(snapshot.shopping_session_id, "tool.result", {
+                "tool": "forget_preference_tool", "deleted": deleted, "remaining": rendered,
             })
-        return {"deleted": deleted, "remaining": [f"[{p.kind}] {p.statement}" for p in remaining]}
+        return {"deleted": deleted, "remaining": rendered}
 
     return [
         StructuredTool.from_function(
             name="remember_preference_tool",
-            description="记住买家稳定偏好，跨会话生效；一次性临时要求不要记。",
-            args_schema=RememberPreferenceArgs,
-            coroutine=remember_preference_tool,
+            description="记住稳定的商品偏好，优先提供 attribute/value；budget_max 必须有 currency。支持材质、品类、品牌、颜色、风格和收货国家。",
+            args_schema=RememberPreferenceArgs, coroutine=remember_preference_tool,
         ),
         StructuredTool.from_function(
             name="forget_preference_tool",
             description="撤回买家历史偏好；statement 必须与现有偏好原文完全一致。",
-            args_schema=ForgetPreferenceArgs,
-            coroutine=forget_preference_tool,
+            args_schema=ForgetPreferenceArgs, coroutine=forget_preference_tool,
         ),
     ]

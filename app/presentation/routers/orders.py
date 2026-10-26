@@ -11,7 +11,9 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from app.presentation.auth import principal
 from app.presentation.dependencies import COMMERCE_AUTH, get_container
+from app.presentation.ownership import authorize_order
 
 
 class CancelRequest(BaseModel):
@@ -46,6 +48,7 @@ def build_orders_router() -> APIRouter:
         Returns:
             订单快照 dict。
         """
+        await authorize_order(request, order_id)
         container = get_container(request)
         try:
             return await container.query_order.execute(order_id)
@@ -64,6 +67,7 @@ def build_orders_router() -> APIRouter:
         Returns:
             订单快照 dict。
         """
+        await authorize_order(request, order_id)
         container = get_container(request)
         try:
             return await container.cancel_order.execute(order_id, body.reason)
@@ -90,6 +94,11 @@ def build_orders_router() -> APIRouter:
         manager = getattr(container, "confirmation_manager", None) if container is not None else None
         if manager is None:
             raise HTTPException(status_code=503, detail="下单确认管理器未就绪")
+        user = principal(request)
+        if user is not None:
+            payload = await manager.preview_payload(body.token)
+            if payload is None or payload.get("buyer_id") != user.buyer_id:
+                raise HTTPException(status_code=404, detail="确认请求不存在")
         try:
             status = await manager.resolve(body.token, body.action)
         except ValueError as err:

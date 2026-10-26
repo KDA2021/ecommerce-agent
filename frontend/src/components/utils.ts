@@ -73,7 +73,13 @@ export function toChatMessages(messages: StoredMessage[]): ChatMessage[] {
 }
 
 /** 预览面板状态 → i18n key。 */
-export function previewHintKey(state: string): string {
+export function previewHintKey(state: string, operation = "create_order"): string {
+  if (operation === "cancel_order") {
+    if (state === PREVIEW_STATE.CONFIRMED) return "order.cancellationWaitingHint";
+    if (state === PREVIEW_STATE.CANCELLED) return "order.cancellationRetainedHint";
+    if (state === PREVIEW_STATE.EXPIRED) return "order.cancellationExpiredHint";
+    return "order.cancellationPendingHint";
+  }
   if (state === PREVIEW_STATE.CONFIRMED) return "order.confirmedHint";
   if (state === PREVIEW_STATE.CANCELLED) return "order.cancelledHint";
   return "order.pendingHint";

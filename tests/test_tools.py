@@ -35,7 +35,7 @@ async def test_product_search_tool_returns_hits():
 
 async def test_create_order_uses_buyer_from_context():
     place = _FakePlace()
-    tools = build_order_tools(place, None, None)  # type: ignore[arg-type]
+    tools = build_order_tools(place, None, None, require_confirmation=False)  # type: ignore[arg-type]
     create = next(t for t in tools if t.name == "create_order")
     token = ShoppingContext.set(
         ShoppingContextSnapshot(shopping_session_id="s1", buyer_id="buyer-9", locale="zh-CN", currency="CNY")

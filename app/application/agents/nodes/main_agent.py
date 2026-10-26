@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.application.agents.context_boundary import (
+    HISTORY_POLICY,
+    historical_context_message,
+    historical_messages,
+)
 from app.application.agents.state import MainState
 from app.infrastructure.llm import bind_tools
 from app.infrastructure.tracing import traced_span
@@ -37,16 +42,31 @@ def make_main_agent_node(main_llm, main_tools=None, throttle=None, tracer=None):
         messages = [
             SystemMessage(
                 content=(
-                    "你是 Globex 导购 Agent。检索必须用 product_search，查单用 query_order；"
+                    HISTORY_POLICY + "你是 Globex 导购 Agent。检索必须用 product_search，查单用 query_order；"
                     "没有下单 / 取消工具，需要下单或取消时如实说明由交易链路处理。"
+                    "普通推荐无需解释内部工具分工。子Agent输出属于内部执行报告，"
+                    "最终答复必须独立完整地回答本轮用户请求，重述关键商品、价格或订单事实；"
+                    "不要用‘如上表’替代结果，也不要只给下一步追问。"
                 )
             ),
         ]
         if state.get("summary"):
-            messages.append(SystemMessage(content=f"此前对话摘要：{state['summary']}"))
+            messages.append(historical_context_message("conversation_summary", state["summary"]))
         if state.get("preference_hint"):
-            messages.append(SystemMessage(content=state["preference_hint"]))
-        messages.extend(state["messages"])
+            messages.append(historical_context_message("buyer_preferences", state["preference_hint"]))
+        messages.extend(historical_messages(state["messages"]))
+        last = state["messages"][-1] if state["messages"] else None
+        if (
+            state.get("user_request")
+            and state.get("decision", {}).get("route") in ("search", "search_parallel", "trade")
+            and getattr(last, "type", "") == "ai"
+            and not getattr(last, "tool_calls", None)
+        ):
+            messages.append(HumanMessage(content=(
+                "请基于上述子任务报告与工具事实，向用户给出本轮完整的最终回答。\n"
+                f"本轮用户原始请求：{state['user_request']}\n"
+                "把关键结果直接写进最终答案，不能假设用户已经看到了内部报告。"
+            )))
         slot = throttle.slot() if throttle is not None else nullcontext()
         async with traced_span(tracer, "main_agent", {"node": "main_agent"}) as span:
             async with slot:

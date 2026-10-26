@@ -14,6 +14,11 @@ from langgraph.graph import START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
+from app.application.agents.context_boundary import (
+    HISTORY_POLICY,
+    historical_context_message,
+    historical_messages,
+)
 from app.application.agents.state import MainState
 from app.application.evidence.task_state import TaskStateStore, TaskStatus
 from app.infrastructure.context import ShoppingContext
@@ -77,12 +82,13 @@ def _subagent_graph(
             if getattr(message, "id", None) is None:
                 message.id = str(uuid.uuid4())
             removals.append(RemoveMessage(id=message.id, content=""))
-        new_messages = [HumanMessage(content=spec.instruction)]
+        new_messages = []
         if state.get("summary"):
-            new_messages.append(SystemMessage(content=f"背景摘要：{state['summary']}"))
+            new_messages.append(historical_context_message("task_background", state["summary"]))
         preference_hint = state.get("preference_hint")
         if inject_preference and preference_hint:
-            new_messages.append(SystemMessage(content=preference_hint))
+            new_messages.append(historical_context_message("buyer_preferences", preference_hint))
+        new_messages.append(HumanMessage(content=spec.instruction))
         return {"messages": [*removals, *new_messages], "turn_compressed": False}
 
     async def agent_node(state: Any) -> dict:
@@ -94,7 +100,7 @@ def _subagent_graph(
         Returns:
             ``{'messages': [AIMessage]}`` 局部更新。
         """
-        messages = [SystemMessage(content=system_prompt), *state["messages"]]
+        messages = [SystemMessage(content=HISTORY_POLICY + system_prompt), *historical_messages(state["messages"])]
         async with traced_span(tracer, name, {"node": "agent"}) as span:
             slot = throttle.slot() if throttle is not None else nullcontext()
             async with slot:

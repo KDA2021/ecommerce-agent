@@ -21,6 +21,7 @@ pytest-cache-files-*/
 .superpowers/
 rednote_exp/
 .pytest-tmp/
+.pytest_tmp*/
 
 # P15-1 make test 的临时目录（TMPDIR 默认值）
 .tmp-make/

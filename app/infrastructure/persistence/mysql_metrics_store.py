@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import LargeBinary, cast, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.application.metrics.session_metrics import MetricsStore, SessionMetrics
@@ -62,7 +62,7 @@ class MySqlMetricsStore(MetricsStore):
         async with self._sessions() as db:
             rows = (await db.scalars(
                 select(SessionMetricsRow)
-                .where(SessionMetricsRow.session_id == session_id)
+                .where(cast(SessionMetricsRow.session_id, LargeBinary) == session_id.encode("utf-8"))
                 .order_by(SessionMetricsRow.id)
                 .limit(max(int(limit), 1)),
             )).all()

@@ -7,8 +7,10 @@ from contextlib import nullcontext
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.application.agents.context_boundary import HISTORY_POLICY, historical_context_message
 from app.application.agents.state import MainState
 from app.application.agents.subagents.base import PlannerDecision
+from app.application.agents.task_context import task_context
 from app.infrastructure.llm import with_structured_output
 from app.infrastructure.tracing import traced_span
 
@@ -63,6 +65,7 @@ def make_planner_node(planner_llm, settings, throttle=None, tracer=None):
             ``{'decision': dict, 'remaining_tasks': list}`` 局部更新。
         """
         route_mode = str(getattr(settings, "model_route_mode", "llm") or "llm").strip().lower()
+        user_text = state["messages"][-1].content
         if route_mode in ("direct", "single", "off"):
             return {
                 "decision": PlannerDecision(
@@ -71,21 +74,22 @@ def make_planner_node(planner_llm, settings, throttle=None, tracer=None):
                     tasks=[],
                 ).model_dump(),
                 "remaining_tasks": [],
+                "user_request": str(user_text),
             }
-        user_text = state["messages"][-1].content
         slot = throttle.slot() if throttle is not None else nullcontext()
         try:
             async with traced_span(tracer, "planner", {"node": "planner"}) as span:
                 async with slot:
                     decision = await planner.ainvoke([
-                        SystemMessage(content=_PLANNER_PROMPT),
+                        SystemMessage(content=HISTORY_POLICY + _PLANNER_PROMPT),
+                        historical_context_message("task_background", task_context(state)),
                         HumanMessage(content=str(user_text)),
                     ])
                 if span is not None and getattr(span, "attrs", None) is not None:
                     span.attrs["route"] = getattr(decision, "route", "")
         except Exception:
             decision = PlannerDecision(route="direct", reasoning="planner 失败降级", tasks=[])
-        update = {"decision": decision.model_dump(), "remaining_tasks": []}
+        update = {"decision": decision.model_dump(), "remaining_tasks": [], "user_request": str(user_text)}
         if decision.route == "trade":
             update["remaining_tasks"] = [task.model_dump() for task in decision.tasks]
         return update

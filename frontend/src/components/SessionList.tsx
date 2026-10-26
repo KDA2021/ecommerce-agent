@@ -8,6 +8,7 @@ export function SessionHistoryPanel({
   sessions,
   sessionId,
   syncing,
+  busy = false,
   syncError,
   onSwitch,
   onNew,
@@ -18,6 +19,7 @@ export function SessionHistoryPanel({
   sessions: StoredSession[];
   sessionId: string;
   syncing: boolean;
+  busy?: boolean;
   syncError: string;
   onSwitch: (id: string) => void;
   onNew: () => void;
@@ -29,7 +31,7 @@ export function SessionHistoryPanel({
       <div style={styles.previewHead}>
         <h2 style={styles.panelTitle}>{t(lang, "history.title")}</h2>
         <div style={styles.orderActions}>
-          <button type="button" style={styles.chipToggle} data-testid="history-new" onClick={onNew}>
+          <button type="button" style={styles.chipToggle} data-testid="history-new" disabled={busy} onClick={onNew}>
             {t(lang, "history.new")}
           </button>
           <button
@@ -43,6 +45,7 @@ export function SessionHistoryPanel({
           </button>
         </div>
       </div>
+      {busy && <p role="status" style={styles.muted}>任务处理中，完成后可切换、新建或删除当前会话 / Please wait for completion before changing sessions.</p>}
       {sessions.length === 0 ? (
         <p style={styles.muted}>{t(lang, "history.empty")}</p>
       ) : (
@@ -61,6 +64,7 @@ export function SessionHistoryPanel({
                   type="button"
                   style={styles.historyButton}
                   onClick={() => onSwitch(session.id)}
+                  disabled={busy}
                   title={session.id}
                 >
                   <span style={styles.historyTitle}>
@@ -79,6 +83,7 @@ export function SessionHistoryPanel({
                   data-testid="history-delete"
                   title={t(lang, "history.delete")}
                   onClick={() => onDelete(session.id)}
+                  disabled={busy && session.id === sessionId}
                 >
                   ✕
                 </button>

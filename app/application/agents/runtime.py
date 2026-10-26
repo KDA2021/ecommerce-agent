@@ -7,8 +7,11 @@
 """
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from langchain_core.messages import HumanMessage
 
+from app.application.data_policy import DataPolicy
 from app.infrastructure.tracing import traced_span
 
 
@@ -22,20 +25,22 @@ def _final_text(messages) -> str:
     return ""
 
 
-async def invoke_agent(agent, session_id: str, query: str) -> str:
+async def invoke_agent(agent, session_id: str, query: str, data_policy=None) -> str:
     """非流式执行一次主图，返回最后一条非工具调用的文本。
 
     Args:
         agent: 编译后的主图。
         session_id: 会话 / 线程 id。
         query: 用户输入。
+        data_policy: 可选输出脱敏策略。
 
     Returns:
         最终回复文本。
     """
     config = {"configurable": {"thread_id": session_id}}
     result = await agent.ainvoke({"messages": [HumanMessage(content=query)]}, config=config)
-    return _final_text(result.get("messages", []))
+    policy = data_policy if data_policy is not None else DataPolicy()
+    return policy.sanitize_output(_final_text(result.get("messages", [])))
 
 
 def _chunk_token(content) -> str:
@@ -54,17 +59,17 @@ def _chunk_token(content) -> str:
 
 
 async def invoke_agent_stream(
-    agent, session_id: str, query: str, broker=None, tracer=None,
+    agent, session_id: str, query: str, broker=None, tracer=None, data_policy=None,
+    output_guard: Callable[[str], Awaitable[str]] | None = None,
 ) -> str:
-    """流式执行 Agent：逐 token 发布 ``token.delta``，返回最终文本。
+    """消费完整模型事件流，脱敏最终 state 后发布一次 ``token.delta``。
 
-    用 ``astream_events(version="v2")`` 消费事件流，只把非空 token 转成
-    ``broker.publish(session_id, "token.delta", {"token": token})``；流结束后用
+    用 ``astream_events(version="v2")`` 消费事件流，原始模型 chunk 留在内部；流结束后用
     ``aget_state`` 取最终消息，避免把工具调用/中间态文本当成答案返回。
     ``final.result`` 由 server 统一发布，这里只返回文本（与 ``invoke_agent`` 同语义）。
 
     对没有 ``astream_events`` 的旧版/测试替身 Agent 优雅降级回非流式 ``invoke_agent``。
-    可选 ``tracer`` 存在时记录 ``request`` 总 span 与首个 token 的 ``ttft`` span；
+    可选 ``tracer`` 存在时记录 ``request`` 总 span 与首个内部模型 token 的 ``ttft`` span；
     ``broker`` 带 ``trace_logger`` 时自动复用，保证生产路径无需额外接线。
 
     Args:
@@ -73,12 +78,19 @@ async def invoke_agent_stream(
         query: 用户输入。
         broker: 可选事件总线，用于发布 token.delta。
         tracer: 可选 LocalTraceLogger / span tracer。
+        data_policy: 可选输出脱敏策略。
+        output_guard: 可选异步完成证据检查，接收文本并返回替换后的 str；
+            在任何最终文本发布/返回前调用，返回值再次脱敏。
 
     Returns:
         最终回复文本（与 ``invoke_agent`` 同语义）。
     """
+    policy = data_policy if data_policy is not None else DataPolicy()
     if not hasattr(agent, "astream_events"):
-        return await invoke_agent(agent, session_id, query)
+        reply = await invoke_agent(agent, session_id, query, data_policy=data_policy)
+        if output_guard is not None:
+            reply = policy.sanitize_output(await output_guard(reply))
+        return reply
 
     if tracer is None:
         tracer = getattr(broker, "trace_logger", None)
@@ -112,8 +124,6 @@ async def invoke_agent_stream(
                 if ttft_open:
                     await ttft_span.__aexit__(None, None, None)
                     ttft_open = False
-                if broker is not None:
-                    broker.publish(session_id, "token.delta", {"token": token})
         except BaseException as exc:  # noqa: BLE001 - 确保 ttft span 落盘后原样抛出
             if ttft_open:
                 await ttft_span.__aexit__(type(exc), exc, exc.__traceback__)
@@ -127,7 +137,13 @@ async def invoke_agent_stream(
         # 流结束后重新取最终 state，避免把流中的工具调用文本当成答案。
         aget_state = getattr(agent, "aget_state", None)
         if aget_state is None:
-            return ""
-        state = await aget_state(config)
-        values = getattr(state, "values", None) or {}
-        return _final_text(values.get("messages", []))
+            final_text = ""
+        else:
+            state = await aget_state(config)
+            values = getattr(state, "values", None) or {}
+            final_text = policy.sanitize_output(_final_text(values.get("messages", [])))
+        if output_guard is not None:
+            final_text = policy.sanitize_output(await output_guard(final_text))
+        if broker is not None and final_text:
+            broker.publish(session_id, "token.delta", {"token": final_text})
+        return final_text

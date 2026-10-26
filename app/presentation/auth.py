@@ -17,7 +17,13 @@ settings 时，仍能通过环境变量开启鉴权）。
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import secrets
+import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import HTTPException, Request
@@ -32,6 +38,96 @@ API_KEY_QUERY_PARAM = "api_key"
 
 #: 鉴权失败时回给客户端的质询头，提示应使用的鉴权方式。
 WWW_AUTHENTICATE_VALUE = API_KEY_HEADER
+
+SESSION_COOKIE = "ecommerce_session"
+SESSION_TTL_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Server-resolved identity; a buyer ID supplied in JSON is not a principal."""
+
+    buyer_id: str
+
+
+def resolve_buyer_keys(container: Any) -> dict[str, str]:
+    settings = getattr(container, "settings", None)
+    raw = getattr(settings, "buyer_api_keys_json", None)
+    if raw is None:
+        raw = getattr(load_settings(), "buyer_api_keys_json", "")
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        keys = json.loads(raw)
+        if not isinstance(keys, dict) or not keys:
+            raise ValueError
+        if any(
+            not isinstance(buyer, str) or not buyer.strip() or buyer != buyer.strip() or len(buyer) > 64
+            or not isinstance(key, str) or len(key) < 16
+            for buyer, key in keys.items()
+        ) or len(set(keys.values())) != len(keys):
+            raise ValueError
+        return keys
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="独立用户访问凭证配置无效") from None
+
+
+def _signing_key(container: Any) -> bytes:
+    # Private server-side credentials supply entropy; key rotation revokes old cookies.
+    material = json.dumps(resolve_buyer_keys(container), sort_keys=True)
+    material += "\n" + resolve_api_key(container)
+    return hashlib.sha256(("ecommerce-cookie-v1\n" + material).encode()).digest()
+
+
+def issue_session(container: Any, buyer_id: str) -> str:
+    payload = json.dumps({"buyer_id": buyer_id, "exp": int(time.time()) + SESSION_TTL_SECONDS})
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    signature = hmac.new(_signing_key(container), encoded.encode(), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def _cookie_buyer(request: Request, container: Any) -> str | None:
+    cookie = request.cookies.get(SESSION_COOKIE, "")
+    try:
+        encoded, signature = cookie.rsplit(".", 1)
+        expected = hmac.new(_signing_key(container), encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        if payload["exp"] <= time.time():
+            return None
+        buyer = payload["buyer_id"]
+        keys = resolve_buyer_keys(container)
+        if (keys and buyer in keys) or (not keys and resolve_api_key(container) and buyer == "buyer-1"):
+            return buyer
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        pass
+    return None
+
+
+def buyer_for_key(container: Any, provided: str) -> str | None:
+    keys = resolve_buyer_keys(container)
+    for buyer, key in keys.items():
+        if _matches(provided, key):
+            return buyer
+    if not keys:
+        expected = resolve_api_key(container)
+        if expected and _matches(provided, expected):
+            return "buyer-1"
+    return None
+
+
+def authenticated_buyer(request: Request, container: Any) -> str | None:
+    for key in _provided_keys(request):
+        if key:
+            buyer = buyer_for_key(container, key)
+            if buyer:
+                return buyer
+    return _cookie_buyer(request, container)
+
+
+def principal(request: Request) -> Principal | None:
+    return getattr(request.state, "principal", None)
 
 
 def _normalize(value: Any) -> str:
@@ -136,11 +232,17 @@ async def require_api_key(request: Request) -> None:
     Raises:
         HTTPException: 缺失或错误的 API Key 返回 401。
     """
-    expected = resolve_api_key(getattr(request.app.state, "container", None))
-    if not expected:
+    container = getattr(request.app.state, "container", None)
+    keys = resolve_buyer_keys(container)
+    expected = resolve_api_key(container)
+    request.state.principal = None
+    if not keys and not expected:
         return  # 未配置 = 不鉴权，向后兼容本地开发。
-    if not _verify_request(request, expected):
+    buyer = authenticated_buyer(request, container)
+    if not buyer:
         raise _unauthorized()
+    if keys:
+        request.state.principal = Principal(buyer)
 
 
 def build_api_key_dependency(api_key: str) -> Callable[..., Any]:

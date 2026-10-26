@@ -83,6 +83,7 @@ class _StreamingAgent(_FakeAgent):
     async def astream_events(self, payload, config, version="v2"):
         for token in ("你", "好", "呀"):
             yield {"event": "on_chat_model_stream", "data": {"chunk": SimpleNamespace(content=token)}}
+        self.history = [AIMessage(content=self.reply)]
 
 
 class _MemoryMetricsStore(MetricsStore):

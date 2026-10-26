@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from app.application.action_authorization import action_authorization
 from app.application.evidence.task_state import TaskRecord, TaskStateStore, TaskStatus
 from app.application.order_confirmation import OrderConfirmationManager
 from app.application.usecases.order_usecases import (
@@ -75,6 +77,12 @@ def _buyer_id() -> str:
     """
     snapshot = ShoppingContext.current()
     return snapshot.buyer_id if snapshot else "anonymous"
+
+
+async def _query_owned(query, order_id: str):
+    if isinstance(query, QueryOrderUseCase) and ShoppingContext.current() is not None:
+        return await query.execute(order_id, buyer_id=_buyer_id())
+    return await query.execute(order_id)
 
 
 def _publish(broker, event_type: str, payload: dict) -> None:
@@ -182,17 +190,39 @@ def _session_scope() -> str:
     return ShoppingContext.current_trace_id() or session_id
 
 
-def _idempotency_key(buyer_id: str, items: list[OrderItemInput], session_scope: str) -> str:
-    """按 spec 生成确定性幂等键。
+def _idempotency_key(
+    buyer_id: str, items: list[OrderItemInput], session_scope: str,
+    shipping_address: dict | None = None,
+) -> str:
+    """生成确定性幂等键；生产 v2 绑定完整订单内容，包含全部收货地址字段。
+
+    地址先补齐与执行相同的默认字段，再做规范 JSON 编码。旧三参调用仅保留
+    兼容行为；生产调用必须传地址，避免地址变化时回放先前订单。
 
     Args:
         buyer_id: 买家 id。
         items: 订单行入参。
         session_scope: 会话 / trace 作用域。
+        shipping_address: 完整收货地址；缺省仅兼容旧 helper 调用。
 
     Returns:
         sha256 前 32 位十六进制串。
     """
+    if shipping_address is not None:
+        payload = {
+            "version": 2,
+            "buyer_id": buyer_id,
+            "session_scope": session_scope,
+            "items": [
+                {"product_id": item.product_id, "sku_id": item.sku_id, "quantity": int(item.quantity)}
+                for item in items
+            ],
+            "shipping_address": AddressArgs.model_validate(shipping_address).model_dump(mode="json"),
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()[:32]
     parts = [buyer_id]
     for item in items:
         parts.extend([item.product_id, item.sku_id, str(int(item.quantity))])
@@ -322,7 +352,7 @@ async def _replay_snapshot(query: QueryOrderUseCase | None, order_id: str) -> di
     if query is None:
         return None
     try:
-        snapshot = await query.execute(order_id)
+        snapshot = await _query_owned(query, order_id)
     except Exception:  # noqa: BLE001 - 查不到/查询失败都退回 MySQL 幂等键路径
         return None
     if not isinstance(snapshot, dict):
@@ -453,7 +483,7 @@ async def _record_evidence(
     verified_snapshot = None
     if query is not None:
         try:
-            verified_snapshot = await query.execute(order_id)
+            verified_snapshot = await _query_owned(query, order_id)
         except Exception:  # noqa: BLE001 - 反查失败只降级为未验证，不改变已发生的下单
             verified_snapshot = None
     if not isinstance(verified_snapshot, dict) or str(verified_snapshot.get("order_id")) != str(order_id):
@@ -480,6 +510,7 @@ def build_order_tools(
     *,
     confirmation_manager: OrderConfirmationManager | None = None,
     settings=None,
+    require_confirmation: bool = True,
 ) -> list[StructuredTool]:
     """构建 create_order / query_order / cancel_order 三个 LangChain 工具。
 
@@ -491,9 +522,10 @@ def build_order_tools(
         task_store: 可选任务证据存储；提供时 create_order 写 EXECUTED→VERIFIED。
         task_id_prefix: 任务证据 id 前缀。
         redis_cache: 可选 RedisCache；提供时 create_order 先走 SETNX 幂等快路径。
-        confirmation_manager: 可选下单确认管理器；提供时 create_order 发布
-            ``order.preview`` 后真实挂起，只有买家确认才调用 place。
+        confirmation_manager: 确认管理器；写工具发布预览后等待真实确认并消费授权。
         settings: 可选运行时配置；用于读取 ``order_confirm_timeout_seconds``。
+        require_confirmation: 默认缺少确认服务时拒绝写入。False 仅供离线业务单测，
+            不会绕过已注入的管理器，也不暴露给模型；生产装配显式为 True。
 
     Returns:
         三个 ``StructuredTool`` 的列表。
@@ -502,6 +534,43 @@ def build_order_tools(
         getattr(settings, "order_confirm_timeout_seconds", DEFAULT_ORDER_CONFIRM_TIMEOUT)
         or DEFAULT_ORDER_CONFIRM_TIMEOUT,
     )
+
+    def denied(action: str, code: str, token: str | None = None) -> dict:
+        _publish(broker, "security.denied", {"action": action, "code": code})
+        result = {"error_code": code, "error": "操作未获得有效确认，请重新发起并确认。", "executed": False}
+        _publish(broker, "tool.result", {"tool": action, "order": result, "confirmation_token": token})
+        return result
+
+    async def approve(action: str, arguments: dict, preview: dict) -> tuple[str | None, dict | None]:
+        # Model text is never approval. Only the authenticated confirmation endpoint
+        # can resolve this server-owned capability, bound to exact arguments.
+        if confirmation_manager is None:
+            return None, denied(action, "approval_unavailable") if require_confirmation else None
+        if ShoppingContext.current() is None:
+            return None, denied(action, "identity_unavailable")
+        binding = action_authorization(action, arguments, buyer_id=_buyer_id(),
+                                       session_id=ShoppingContext.current_session_id())
+        token = await confirmation_manager.create_preview({
+            **preview, "buyer_id": _buyer_id(), "session_id": ShoppingContext.current_session_id(),
+            "_authorization": {**binding, "expires_at": time.time() + confirm_timeout},
+        })
+        _publish(broker, ORDER_PREVIEW_EVENT, {"tool": action, "token": token, "preview": preview})
+        try:
+            outcome = await confirmation_manager.wait(token, confirm_timeout)
+            if outcome != "confirmed":
+                result = {**_confirmation_cancelled("user_cancelled" if outcome == "cancelled"
+                                                   else "confirmation_timeout"), "executed": False}
+                _publish(broker, "tool.result", {"tool": action, "order": result, "confirmation_token": token})
+                return token, result
+            # Recompute at the execution boundary, including current server identity.
+            expected = action_authorization(action, arguments, buyer_id=_buyer_id(),
+                                            session_id=ShoppingContext.current_session_id())
+            if not await confirmation_manager.consume(token, expected):
+                return token, denied(action, "approval_invalid", token)
+            _publish(broker, "security.authorized", {"action": action, "arguments_sha256": expected["arguments_sha256"]})
+            return token, None
+        finally:
+            await confirmation_manager.clear(token)
 
     async def create_order(items: list[OrderItemArgs], shipping_address: AddressArgs) -> dict:
         """创建订单（下单即 CONFIRMED），返回订单快照与验证状态。
@@ -525,32 +594,9 @@ def build_order_tools(
             {"tool": "create_order", "args": preview_payload},
         )
 
-        # ── 真实确认握手：发布预览 → 挂起 → 只有 confirmed 才继续 ──
-        confirm_token: str | None = None
-        if confirmation_manager is not None:
-            confirm_token = await confirmation_manager.create_preview(preview_payload)
-            _publish(
-                broker,
-                ORDER_PREVIEW_EVENT,
-                {
-                    "tool": "create_order",
-                    "token": confirm_token,
-                    "preview": preview_payload,
-                },
-            )
-            try:
-                outcome = await confirmation_manager.wait(confirm_token, confirm_timeout)
-            except asyncio.CancelledError:
-                # 外层请求被取消（客户端断开 / 工具超时）：清理 pending token，
-                # 避免 token 表残留；取消不代表下单，place 不会被触碰。
-                await confirmation_manager.clear(confirm_token)
-                raise
-            if outcome != "confirmed":
-                # 取消 / 超时：不下单，并显式告知调用方原因。
-                reason = "user_cancelled" if outcome == "cancelled" else "confirmation_timeout"
-                result = _confirmation_cancelled(reason)
-                _publish(broker, "tool.result", {"tool": "create_order", "order": result})
-                return result
+        confirm_token, rejection = await approve("create_order", preview_payload, preview_payload)
+        if rejection is not None:
+            return rejection
 
         try:
             order_items = [
@@ -562,7 +608,9 @@ def build_order_tools(
                 for item in items
             ]
             buyer_id = _buyer_id()
-            idempotency_key = _idempotency_key(buyer_id, order_items, _session_scope())
+            idempotency_key = _idempotency_key(
+                buyer_id, order_items, _session_scope(), preview_payload["shipping_address"],
+            )
             place_kwargs = {
                 "buyer_id": buyer_id,
                 "items": order_items,
@@ -583,7 +631,7 @@ def build_order_tools(
             if result is None:
                 result = await _call_place(place, place_kwargs, idempotency_key)
         except (ValueError, KeyError, TypeError) as err:
-            _publish(broker, "tool.result", {"tool": "create_order", "error": str(err)})
+            _publish(broker, "tool.result", {"tool": "create_order", "error": str(err), "confirmation_token": confirm_token})
             return {"error": str(err)}
 
         # 成功回填 key→order_id（TTL 300s），让下一次命中直接回放。
@@ -616,7 +664,7 @@ def build_order_tools(
                 "verification_status": verification_status,
             }
 
-        _publish(broker, "tool.result", {"tool": "create_order", "order": result})
+        _publish(broker, "tool.result", {"tool": "create_order", "order": result, "confirmation_token": confirm_token})
         return result
 
     async def query_order(order_id: str) -> dict:
@@ -634,8 +682,8 @@ def build_order_tools(
             {"tool": "query_order", "args": {"order_id": order_id}},
         )
         try:
-            result = await query.execute(order_id)
-        except ValueError as err:
+            result = await _query_owned(query, order_id)
+        except (ValueError, PermissionError) as err:
             _publish(broker, "tool.result", {"tool": "query_order", "error": str(err)})
             return {"error": str(err)}
         _publish(broker, "tool.result", {"tool": "query_order", "order": result})
@@ -659,18 +707,32 @@ def build_order_tools(
                 "args": {"order_id": order_id, "reason": reason},
             },
         )
+        confirm_token = None
         try:
-            result = await cancel.execute(order_id, reason)
-        except ValueError as err:
-            _publish(broker, "tool.result", {"tool": "cancel_order", "error": str(err)})
+            arguments = {"order_id": order_id, "reason": reason}
+            # A trusted read populates the preview; ownership is rechecked by the
+            # transactional use case when the confirmed operation actually executes.
+            if confirmation_manager is not None:
+                snapshot = await _query_owned(query, order_id)
+            else:
+                snapshot = None
+            confirm_token, rejection = await approve("cancel_order", arguments, {**arguments, "order": snapshot})
+            if rejection is not None:
+                return rejection
+            if isinstance(cancel, CancelOrderUseCase) and ShoppingContext.current() is not None:
+                result = await cancel.execute(order_id, reason, buyer_id=_buyer_id())
+            else:
+                result = await cancel.execute(order_id, reason)
+        except (ValueError, PermissionError) as err:
+            _publish(broker, "tool.result", {"tool": "cancel_order", "error": str(err), "confirmation_token": confirm_token, "order_id": order_id})
             return {"error": str(err)}
-        _publish(broker, "tool.result", {"tool": "cancel_order", "order": result})
+        _publish(broker, "tool.result", {"tool": "cancel_order", "order": result, "confirmation_token": confirm_token})
         return result
 
     return [
         StructuredTool.from_function(
             name="create_order",
-            description="创建订单（直接进入 CONFIRMED 态）。必须在买家确认后调用。买家身份由系统会话上下文注入，不要自行编造。",
+            description="提出创建订单请求，服务端展示参数并等待买家确认后才执行。买家身份由系统会话上下文注入。",
             args_schema=CreateOrderArgs,
             coroutine=create_order,
         ),
@@ -682,7 +744,7 @@ def build_order_tools(
         ),
         StructuredTool.from_function(
             name="cancel_order",
-            description="取消订单（仅 CONFIRMED 态可取消），取消后自动回补库存。",
+            description="提出取消订单请求（仅 CONFIRMED 态），服务端等待买家确认后才取消并回补库存。",
             args_schema=CancelOrderArgs,
             coroutine=cancel_order,
         ),

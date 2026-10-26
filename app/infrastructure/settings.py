@@ -229,6 +229,8 @@ class Settings:
     # 配置后 /commerce/* 需要 X-API-Key 请求头或 ?api_key= 查询参数；
     # /health 与 /docs 始终开放。
     api_key: str = ""
+    buyer_api_keys_json: str = field(default="", repr=False)
+    auth_cookie_secure: bool = False
 
     # ============================
     # 16. 多 worker 队列与广播（P11-4，可选）
@@ -402,6 +404,8 @@ def load_settings() -> Settings:
         # --- API Key 鉴权（P11-3，可选）---
         # 空字符串 = 不鉴权；配置后 /commerce/* 校验 X-API-Key / ?api_key=。
         api_key=os.getenv("API_KEY", ""),
+        buyer_api_keys_json=os.getenv("BUYER_API_KEYS_JSON", ""),
+        auth_cookie_secure=os.getenv("AUTH_COOKIE_SECURE", "0").lower() in ("1", "true", "yes"),
 
         # --- 多 worker 队列与广播（P11-4，可选）---
         # direct（默认）= 请求内直接跑 Agent；redis = 入队 + worker 消费。

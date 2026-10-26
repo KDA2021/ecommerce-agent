@@ -12,9 +12,10 @@ import logging
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.application.agents.main_graph import invoke_agent, invoke_agent_stream
+from app.application.data_policy import DataPolicy
 from app.application.evidence.completion_guard import CompletionGuard
 from app.application.memory.preference_selector import render_preference_lines
 from app.application.metrics.session_metrics import (
@@ -48,6 +49,7 @@ class IntentRequest(BaseModel):
     locale: str = "zh-CN"     # 语言/地区，默认中文
     currency: str = "CNY"     # 期望价格币种，默认人民币
     preference_hint: PreferenceHint | str | None = None  # 偏好 chips（结构化或自然语言）
+    client_request_id: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9._:\-]*$")
 
 
 class IntentResponse(BaseModel):
@@ -57,6 +59,8 @@ class IntentResponse(BaseModel):
     reply: str                # 经过完成门控后的最终回复
     task_id: str = ""         # P11-4 队列模式回填；direct 模式为空
     status: str = ""          # queued / done ...；direct 模式为空
+    trace_id: str = ""
+    client_request_id: str = ""
 
 
 class TaskStatusResponse(BaseModel):
@@ -189,7 +193,8 @@ async def _guard_completion(container, trace_id: str, reply: str) -> str:
             verified_order_ids = await _collect_verified_order_ids(task_store, trace_id)
         except Exception:  # noqa: BLE001 - 证据读取失败按“未验证”处理，门控 fail closed
             verified_order_ids = []
-    return CompletionGuard.guard(reply, verified_order_ids)
+    policy = getattr(container, "data_policy", None) or DataPolicy()
+    return policy.sanitize_output(CompletionGuard.guard(reply, verified_order_ids))
 
 
 async def _record_session_metrics(
@@ -243,16 +248,19 @@ def _new_intent_snapshot(body: IntentRequest) -> ShoppingContextSnapshot:
         locale=body.locale,
         currency=body.currency,
         trace_id=uuid4().hex,
+        client_request_id=body.client_request_id,
     )
 
 
-def _queued_intent_response(task_id: str, session_id: str) -> IntentResponse:
+def _queued_intent_response(task_id: str, session_id: str, client_request_id: str = "") -> IntentResponse:
     """构造队列模式（``QUEUE_MODE=redis``）的接受响应。"""
     return IntentResponse(
         shopping_session_id=session_id,
         reply="",
         task_id=task_id,
         status="queued",
+        trace_id=task_id,
+        client_request_id=client_request_id,
     )
 
 
@@ -312,6 +320,7 @@ async def _enqueue_intent(container, body: IntentRequest, snapshot: ShoppingCont
         currency=body.currency,
         raw_query=body.query,
         experiment_config=payload_config,
+        client_request_id=body.client_request_id,
     )
     try:
         message_id = await task_queue.enqueue(task)
@@ -327,7 +336,7 @@ async def _enqueue_intent(container, body: IntentRequest, snapshot: ShoppingCont
     await task_queue.set_status(
         TaskStatus(task_id=task.task_id, state="queued", queue_position=0),
     )
-    return _queued_intent_response(task.task_id, body.shopping_session_id)
+    return _queued_intent_response(task.task_id, body.shopping_session_id, body.client_request_id)
 
 
 async def _run_intent_direct(container, body: IntentRequest) -> IntentResponse:
@@ -386,19 +395,27 @@ async def _run_intent_direct(container, body: IntentRequest) -> IntentResponse:
             return IntentResponse(
                 shopping_session_id=body.shopping_session_id,
                 reply=guarded_reply,
+                trace_id=snapshot.trace_id,
+                client_request_id=body.client_request_id,
             )
 
         if container.broker is not None:
             # 有 broker 才走流式：token.delta 才能实时进 SSE 队列。
             reply = await invoke_agent_stream(
                 container.agent, body.shopping_session_id, agent_query, container.broker,
+                data_policy=getattr(container, "data_policy", None),
+                output_guard=lambda text: _guard_completion(container, snapshot.trace_id, text),
             )
         else:
             reply = await invoke_agent(
                 container.agent, body.shopping_session_id, agent_query,
+                data_policy=getattr(container, "data_policy", None),
             )
     except Exception as err:  # noqa: BLE001
-        container.broker.publish(body.shopping_session_id, "error", {"message": str(err)})
+        policy = getattr(container, "data_policy", None) or DataPolicy()
+        safe_error = policy.sanitize_output(str(err))
+        if container.broker is not None:
+            container.broker.publish(body.shopping_session_id, "error", {"message": safe_error})
         # 失败请求也要留一行，避免成本统计漏掉真实发生过的 LLM 调用。
         await _record_session_metrics(
             container,
@@ -407,13 +424,17 @@ async def _run_intent_direct(container, body: IntentRequest) -> IntentResponse:
             trace_id=snapshot.trace_id,
             query=body.query,
         )
-        raise HTTPException(status_code=500, detail=str(err)) from err
+        raise HTTPException(status_code=500, detail=safe_error) from None
     finally:
         reset_collector(metrics_token)
         ShoppingContext.reset(token)
 
     reply = await _guard_completion(container, snapshot.trace_id, reply)
-    container.broker.publish(body.shopping_session_id, "final.result", {"reply": reply})
+    if container.broker is not None:
+        container.broker.publish(body.shopping_session_id, "final.result", {
+            "reply": reply, "trace_id": snapshot.trace_id,
+            "client_request_id": body.client_request_id,
+        })
     # 仅首轮写缓存，避免把依赖上下文的回复固化成通用答案。
     if not has_history:
         await container.semantic_cache.remember(
@@ -427,7 +448,8 @@ async def _run_intent_direct(container, body: IntentRequest) -> IntentResponse:
         query=body.query,
         reply=reply,
     )
-    return IntentResponse(shopping_session_id=body.shopping_session_id, reply=reply)
+    return IntentResponse(shopping_session_id=body.shopping_session_id, reply=reply,
+                          trace_id=snapshot.trace_id, client_request_id=body.client_request_id)
 
 
 def build_intents_router() -> APIRouter:
@@ -456,6 +478,15 @@ def build_intents_router() -> APIRouter:
         Raises:
             HTTPException: redis 模式入队失败返回 503。
         """
+        from app.presentation.auth import principal
+        from app.presentation.ownership import authorize_session
+
+        user = principal(request)
+        if user is not None:
+            if body.buyer_id != user.buyer_id:
+                raise HTTPException(status_code=403, detail="买家编号与登录身份不一致")
+            body = body.model_copy(update={"buyer_id": user.buyer_id})
+        await authorize_session(request, body.shopping_session_id, claim=True)
         container = get_container(request)
         # P11-4：QUEUE_MODE=redis 时请求线程只收单，真实执行在 worker 进程。
         if _queue_mode_enabled(container):
@@ -480,6 +511,15 @@ def build_intents_router() -> APIRouter:
         if task_queue is None or not getattr(task_queue, "enabled", False):
             raise HTTPException(status_code=503, detail="任务队列未启用（QUEUE_MODE=direct）")
         status = await task_queue.get_status(task_id)
+        from app.presentation.auth import principal
+
+        user = principal(request)
+        if user is not None:
+            getter = getattr(task_queue, "get_task_owner", None)
+            if getter is None:
+                raise HTTPException(status_code=503, detail="任务归属存储未就绪")
+            if await getter(task_id) != user.buyer_id:
+                raise HTTPException(status_code=404, detail="任务不存在")
         if status is None:
             return TaskStatusResponse(task_id=task_id, state="unknown", found=False)
         return TaskStatusResponse(

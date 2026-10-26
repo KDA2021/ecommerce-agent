@@ -270,9 +270,14 @@ def test_intents_direct_returns_reply_and_publishes_final_result():
         "reply": "测试回复",
         "task_id": "",
         "status": "",
+        "trace_id": response.json()["trace_id"],
+        "client_request_id": "",
     }
     assert len(agent.calls) == 1
-    assert broker.events == [("s-compat", "final.result", {"reply": "测试回复"})]
+    assert response.json()["trace_id"]
+    assert broker.events == [("s-compat", "final.result", {
+        "reply": "测试回复", "trace_id": response.json()["trace_id"], "client_request_id": "",
+    })]
 
 
 def test_intents_redis_mode_returns_task_and_status_route():

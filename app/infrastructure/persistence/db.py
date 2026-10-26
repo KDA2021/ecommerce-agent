@@ -5,8 +5,9 @@ from __future__ import annotations
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.schema import CreateColumn
 
-from app.infrastructure.persistence.tables import Base
+from app.infrastructure.persistence.tables import Base, BuyerPreferenceRow
 
 
 def create_engine(database_url: str) -> AsyncEngine:
@@ -74,6 +75,17 @@ async def bootstrap_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         # create_all 只补缺失的表；旧表结构升级靠下面的显式迁移。
         await conn.run_sync(Base.metadata.create_all)
+        # Additive memory upgrade: old rows keep NULL metadata and are validated
+        # before use. No historical statement is rewritten or removed at startup.
+        def missing_preference_columns(sync_conn):
+            existing = {row["name"] for row in inspect(sync_conn).get_columns("buyer_preferences")}
+            return [str(CreateColumn(column).compile(dialect=sync_conn.dialect))
+                    for column in BuyerPreferenceRow.__table__.columns
+                    if column.name in {"attribute", "value", "currency", "source_session_id", "updated_at"}
+                    and column.name not in existing]
+
+        for column_ddl in await conn.run_sync(missing_preference_columns):
+            await conn.execute(text("ALTER TABLE buyer_preferences ADD COLUMN " + column_ddl))
         add_column, add_unique_index = await conn.run_sync(_orders_idempotency_migration_plan)
         if add_column:
             await conn.execute(

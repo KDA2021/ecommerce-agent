@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.domain.catalog.ports.product_repository import ProductRepository
 from app.domain.catalog.product import Product
@@ -113,16 +114,29 @@ def _aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.replace(tzinfo=timezone.utc) if dt else None
 
 
-class MySqlProductRepository(ProductRepository):
-    """MySQL 商品仓储（products 表，payload 为 JSON）。"""
-
-    def __init__(self, engine: AsyncEngine) -> None:
-        """初始化 sessionmaker。
-
-        Args:
-            engine: 数据库引擎。
-        """
+class _SessionRepository:
+    def __init__(self, engine: AsyncEngine, session: Optional[AsyncSession] = None) -> None:
+        self._engine = engine
+        self._managed_session = session
         self._sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def _session(self):
+        if self._managed_session is not None:
+            yield self._managed_session
+        else:
+            async with self._sessions() as db:
+                yield db
+
+    async def _finish_write(self, db):
+        if self._managed_session is None:
+            await db.commit()
+        else:
+            await db.flush()
+
+
+class MySqlProductRepository(_SessionRepository, ProductRepository):
+    """MySQL 商品仓储（products 表，payload 为 JSON）。"""
 
     async def find_by_id(self, product_id: str) -> Optional[Product]:
         """按商品 ID 查询。
@@ -133,8 +147,11 @@ class MySqlProductRepository(ProductRepository):
         Returns:
             Product；未命中返回 None。
         """
-        async with self._sessions() as db:
-            row = await db.get(ProductRow, product_id)
+        async with self._session() as db:
+            statement = select(ProductRow).where(ProductRow.product_id == product_id)
+            if self._managed_session is not None:
+                statement = statement.with_for_update()
+            row = (await db.scalars(statement)).first()
         return product_from_dict(row.payload) if row else None
 
     async def find_by_ids(self, product_ids: list[str]) -> list[Product]:
@@ -148,8 +165,11 @@ class MySqlProductRepository(ProductRepository):
         """
         if not product_ids:
             return []
-        async with self._sessions() as db:
-            rows = (await db.scalars(select(ProductRow).where(ProductRow.product_id.in_(product_ids)))).all()
+        async with self._session() as db:
+            statement = select(ProductRow).where(ProductRow.product_id.in_(product_ids)).order_by(ProductRow.product_id)
+            if self._managed_session is not None:
+                statement = statement.with_for_update()
+            rows = (await db.scalars(statement)).all()
         return [product_from_dict(row.payload) for row in rows]
 
     async def list_all(self) -> list[Product]:
@@ -158,7 +178,7 @@ class MySqlProductRepository(ProductRepository):
         Returns:
             Product 列表。
         """
-        async with self._sessions() as db:
+        async with self._session() as db:
             rows = (await db.scalars(select(ProductRow).order_by(ProductRow.product_id))).all()
         return [product_from_dict(row.payload) for row in rows]
 
@@ -168,7 +188,7 @@ class MySqlProductRepository(ProductRepository):
         Returns:
             商品数。
         """
-        async with self._sessions() as db:
+        async with self._session() as db:
             return int(await db.scalar(select(func.count()).select_from(ProductRow)) or 0)
 
     async def save(self, product: Product) -> None:
@@ -177,13 +197,13 @@ class MySqlProductRepository(ProductRepository):
         Args:
             product: 商品聚合。
         """
-        async with self._sessions() as db:
+        async with self._session() as db:
             row = await db.get(ProductRow, product.product_id)
             # 只更新已存在行：新增商品统一走 insert_many，避免这里静默插入脏数据。
             if row is not None:
                 row.payload = product_to_dict(product)
                 row.chroma_id = product_chroma_id(product.product_id)
-                await db.commit()
+                await self._finish_write(db)
 
     async def insert_many(self, products: list[Product]) -> None:
         """批量插入商品（IGNORE 已存在行）。
@@ -193,7 +213,7 @@ class MySqlProductRepository(ProductRepository):
         """
         if not products:
             return
-        async with self._sessions() as db:
+        async with self._session() as db:
             for product in products:
                 # IGNORE 让 seed 脚本可重复执行：已存在的 product_id 不覆盖。
                 stmt = (
@@ -206,71 +226,66 @@ class MySqlProductRepository(ProductRepository):
                     .prefix_with("IGNORE")
                 )
                 await db.execute(stmt)
-            await db.commit()
+            await self._finish_write(db)
 
 
-class MySqlOrderRepository(OrderRepository):
+class MySqlOrderRepository(_SessionRepository, OrderRepository):
     """MySQL 订单仓储（orders + order_items）。"""
 
-    def __init__(self, engine: AsyncEngine) -> None:
-        """初始化 sessionmaker。
+    def __init__(self, engine: AsyncEngine, session: Optional[AsyncSession] = None) -> None:
+        super().__init__(engine, session)
+        self._loaded_order_ids: set[str] = set()
 
-        Args:
-            engine: 数据库引擎。
-        """
-        self._sessions = async_sessionmaker(engine, expire_on_commit=False)
+    def transaction_factory(self, product_repo):
+        from app.infrastructure.persistence.mysql_transactions import MySqlOrderTransactionFactory
+        if not isinstance(product_repo, MySqlProductRepository) or product_repo._engine is not self._engine:
+            raise ValueError("MySQL order and product repositories must share an engine")
+        if self._managed_session is not None or product_repo._managed_session is not None:
+            raise ValueError("Provide the outer transaction factory explicitly")
+        return MySqlOrderTransactionFactory(self._engine)
 
     async def save(self, order: Order) -> None:
-        """upsert 订单头并重建订单行。
+        """Insert new orders without swallowing a unique idempotency-key collision.
 
-        Args:
-            order: 订单聚合。
+        Existing orders update by primary key only. A duplicate key for another
+        order must abort the whole stock transaction, never become an upsert.
         """
-        async with self._sessions() as db:
-            # 先 upsert 订单头：重放同一 order_id 时覆盖为最新状态。
-            await db.execute(
-                mysql_insert(OrderRow)
-                .values(
-                    order_id=order.order_id,
-                    buyer_id=order.buyer_id,
-                    status=order.status.value,
-                    currency=order.total_amount().currency,
-                    total_amount_minor=order.total_amount().amount_in_minor_units,
-                    shipping_address=_address_to_dict(order.shipping_address),
-                    created_at=_naive_utc(order.created_at),
-                    confirmed_at=_naive_utc(order.confirmed_at),
-                    cancelled_at=_naive_utc(order.cancelled_at),
-                    cancel_reason=order.cancel_reason,
-                    idempotency_key=order.idempotency_key,
-                )
-                .on_duplicate_key_update(
-                    status=order.status.value,
-                    currency=order.total_amount().currency,
-                    total_amount_minor=order.total_amount().amount_in_minor_units,
-                    shipping_address=_address_to_dict(order.shipping_address),
-                    confirmed_at=_naive_utc(order.confirmed_at),
-                    cancelled_at=_naive_utc(order.cancelled_at),
-                    cancel_reason=order.cancel_reason,
-                    idempotency_key=order.idempotency_key,
-                )
+        async with self._session() as db:
+            # Within a UoW, only orders read for update may be updated. A newly
+            # allocated ID must INSERT and fail on a stale/missing counter,
+            # rather than silently overwrite an unrelated historical order.
+            row = None
+            if self._managed_session is None or order.order_id in self._loaded_order_ids:
+                row = await db.get(OrderRow, order.order_id)
+            values = dict(
+                buyer_id=order.buyer_id,
+                status=order.status.value,
+                currency=order.total_amount().currency,
+                total_amount_minor=order.total_amount().amount_in_minor_units,
+                shipping_address=_address_to_dict(order.shipping_address),
+                created_at=_naive_utc(order.created_at),
+                confirmed_at=_naive_utc(order.confirmed_at),
+                cancelled_at=_naive_utc(order.cancelled_at),
+                cancel_reason=order.cancel_reason,
+                idempotency_key=order.idempotency_key,
             )
-            # 再删旧行重建：保证订单行与聚合一致（整单覆盖写）。
+            if row is None:
+                db.add(OrderRow(order_id=order.order_id, **values))
+            else:
+                for name, value in values.items():
+                    setattr(row, name, value)
+            # Enforce uniqueness before touching the existing line set.
+            await db.flush()
+            self._loaded_order_ids.add(order.order_id)
             await db.execute(delete(OrderItemRow).where(OrderItemRow.order_id == order.order_id))
-            db.add_all(
-                [
-                    OrderItemRow(
-                        order_id=order.order_id,
-                        product_id=line.product_id,
-                        sku_id=line.sku_id,
-                        title=line.title,
-                        unit_price_minor=line.unit_price.amount_in_minor_units,
-                        currency=line.unit_price.currency,
-                        quantity=line.quantity,
-                    )
-                    for line in order.lines
-                ],
-            )
-            await db.commit()
+            db.add_all([
+                OrderItemRow(order_id=order.order_id, product_id=line.product_id,
+                    sku_id=line.sku_id, title=line.title,
+                    unit_price_minor=line.unit_price.amount_in_minor_units,
+                    currency=line.unit_price.currency, quantity=line.quantity)
+                for line in order.lines
+            ])
+            await self._finish_write(db)
 
     async def find_by_id(self, order_id: str) -> Optional[Order]:
         """按订单号查询订单聚合。
@@ -281,10 +296,14 @@ class MySqlOrderRepository(OrderRepository):
         Returns:
             Order；未命中返回 None。
         """
-        async with self._sessions() as db:
-            row = await db.get(OrderRow, order_id)
+        async with self._session() as db:
+            statement = select(OrderRow).where(OrderRow.order_id == order_id)
+            if self._managed_session is not None:
+                statement = statement.with_for_update()
+            row = (await db.scalars(statement)).first()
             if row is None:
                 return None
+            self._loaded_order_ids.add(order_id)
             line_rows = (await db.scalars(select(OrderItemRow).where(OrderItemRow.order_id == order_id))).all()
         return _row_to_order(row, line_rows)
 
@@ -297,7 +316,7 @@ class MySqlOrderRepository(OrderRepository):
         Returns:
             Order；未命中返回 None。
         """
-        async with self._sessions() as db:
+        async with self._session() as db:
             row = (
                 await db.scalars(
                     select(OrderRow).where(OrderRow.idempotency_key == idempotency_key),
@@ -326,7 +345,7 @@ class MySqlOrderRepository(OrderRepository):
             订单号，如 ``GBX-000047``。
         """
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        async with self._sessions() as db:
+        async with self._session() as db:
             # 首次取号前保证序列行存在；已存在时 ON DUPLICATE KEY 什么都不改。
             await db.execute(
                 mysql_insert(OrderCounterRow)
@@ -342,7 +361,7 @@ class MySqlOrderRepository(OrderRepository):
                 {"name": ORDER_COUNTER_NAME, "now": now},
             )
             sequence = int(await db.scalar(text("SELECT LAST_INSERT_ID()")))
-            await db.commit()
+            await self._finish_write(db)
         return format_order_id(sequence)
 
 

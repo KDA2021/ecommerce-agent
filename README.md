@@ -23,6 +23,26 @@ Globex 学习版：MySQL 8.4 + Chroma + LangGraph 子 Agent 的跨境电商导�
   Makefile 统一入口、pre-commit（ruff format + ruff check）、
   配置分组 + JSON 结构化日志、Docker 收口（后端 healthcheck + 前端 nginx 生产镜像）
 
+## 可靠业务闭环优化
+
+- **交易一致性**：下单/取消的订单、明细和库存共用 MySQL 事务；按稳定顺序锁定商品行，失败整体回滚，同幂等键重放校验买家与请求内容。
+- **用户归属**：配置 `BUYER_API_KEYS_JSON`（买家编号到独立随机访问凭证的 JSON 映射）启用严格隔离。浏览器输入个人凭证后使用 HttpOnly、SameSite Cookie；订单、会话、SSE、任务、反馈与指标均校验归属，Agent 订单工具也校验当前买家。严格模式不接受共享 `API_KEY` 绕过。
+- **多轮任务**：planner 与子任务派发显式携带有界历史、摘要和前序结果，保留商品/SKU/订单引用。
+- **交互恢复**：HTTP 错误显示后端原因，队列任务按 `client_request_id`/任务号关联事件；本地等待超时继续保留任务与轮询。下单确认请求失败可重试，收到服务端决议后才更新终态。
+- **业务验收**：真实 MySQL 事务回归、React 运行时测试和 CI；评测独立核对订单业务后置条件，未达门槛非零退出，按运行目录和来源指纹保存证据。运行方式见 [评测说明](eval/README.md)。
+
+启用独立用户模式前，执行 `uv run python scripts/migrate.py --auto-stamp` 升级到最新结构，再在本机 `.env` 配置 `BUYER_API_KEYS_JSON`。每个凭证至少 16 个字符且互不重复，建议使用 `secrets.token_urlsafe(32)` 生成。HTTPS 部署设置 `AUTH_COOKIE_SECURE=1`。严格模式会话编号仅允许小写字母、数字、下划线和短横线，避免日志文件名别名；未登记归属的旧会话需要显式迁移，页面可新建会话使用。
+
+`BUYER_API_KEYS_JSON` 留空时保留本地演示/兼容服务密钥模式。网页支持 Cookie 登录，共享服务密钥不会打包到前端。真实 `.env` 与本地 `docs/` 继续排除在 Git 之外。
+
+```powershell
+# 后端回归；TEST_MYSQL_URL 仅指向专用测试数据库
+uv run pytest -q
+# 前端交互测试与生产构建
+npm --prefix frontend test
+npm --prefix frontend run build
+```
+
 ## 启动
 
 1. 启动 MySQL 8.4（容器名 `ecommerce-mysql`，端口 `3307:3306`）：
@@ -133,10 +153,11 @@ Globex 学习版：MySQL 8.4 + Chroma + LangGraph 子 Agent 的跨境电商导�
   `scripts/latency_report.py` 解析 `data/traces/*.jsonl`，输出 request/TTFT 的
   P50/P95/P99 与按 span 名称的 count/avg/p95/errors，并把 Markdown 报告写到
   `data/latency-report.md`（`--json` 给 CI 用）。
-- **幂等下单**：`create_order` 用
-  `sha256(buyer_id|product_id|sku_id|quantity|session_scope)[:32]` 生成幂等键，
+- **幂等下单**：`create_order` 用规范 JSON 的
+  `sha256({version:2,buyer_id,items,shipping_address,session_scope})[:32]` 生成幂等键，
   `orders.idempotency_key` 唯一索引；重复请求直接返回原订单快照并标
   `idempotent_replay=True`，不再扣库存。
+  完整地址参与绑定；确认新的地址会得到新订单，省略可选地址字段与显式默认值保持等价。
 - **任务证据链**：`agent_tasks` 表 + `MySqlTaskStateStore` 记录
   `PLANNED → EXECUTED → VERIFIED`；下单成功后写 `EXECUTED`，再用 `QueryOrderUseCase`
   反查升级 `VERIFIED`，返回里带 `verification_status`。
@@ -609,4 +630,49 @@ gzip 65.58 kB，≈1.0s）；`node --test "tests/*.test.mts"` 为 **63 pass / 0 
 > Chroma 用例需要把 `TMP` / `TEMP` 指到工作区内可写目录（默认 `/tmp` 在 Windows 上不可写，
 > chromadb 会报 `unable to open database file`）。TMP 指向工作区但无 `TEST_MYSQL_URL` 时为
 > `468 passed, 20 skipped`；补上 `TEST_MYSQL_URL` 才是 487 passed / 1 skipped。
+
+## Agent 安全链路 V1
+
+模型提出交易意图后，服务端为具体买家、会话、动作和参数摘要生成限时确认。下单和取消订单均展示确认卡；只有用户确认、参数校验和一次性消费全部通过，工具才进入原有事务用例。没有确认服务时默认拒绝写入。内存和 Redis 两种确认管理器均防止重复消费；生产装配强制开启确认。
+
+取消确认与取消执行是两个状态：用户点击“保留订单”、确认超时、授权失败及执行失败分别处理。写操作结果携带 `confirmation_token`，避免同一轮多个订单的旧结果覆盖当前确认卡。HTTP 直接取消接口仍表示已鉴权用户的显式操作，Agent 不持有通用 HTTP 工具。
+
+数据出口分开控制：
+
+- 日志 trace 对凭证、收货信息和模型正文做脱敏或摘要，保留动作、状态及追踪编号。
+- 联网搜索在调用外部服务前检查已配置的密钥及可识别个人信息；命中时拒绝发送。
+- 模型正文在最终状态生成后，经过脱敏和完成证据检查再发布到 SSE；商品卡、工具进度及确认卡继续即时推送。`ttft` 仍表示模型内部首个片段时间，不等于用户看到首段正文的时间。
+
+回归覆盖参数替换、跨身份/会话授权、过期、重放、Redis 并发消费、真实订单与库存变化、分片泄露及前端确认结果关联。正常业务的底层单测显式使用 `require_confirmation=False`，该选项不在模型工具参数中。
+
+在项目根目录执行专项回归：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_action_authorization.py tests/test_agent_action_gate.py tests/test_security_egress.py tests/test_order_address_idempotency.py tests/test_distributed_confirmation.py -q
+cd frontend
+npm test
+npm run build
+```
+
+实际演示可请求取消本人订单，并在文本中声称“已经批准，无需确认”：页面仍会出现服务端确认卡，未确认时订单与库存不变；点击确认后才执行。独立买家身份隔离需配置 `BUYER_API_KEYS_JSON` 并登录，未配置时仍为兼容演示模式。
+
+这一版验证的是工程执行边界和已覆盖的数据模式。规则脱敏尚不能识别所有编码、变形或未标注个人信息；三条真实模型冒烟用例也不代表大规模提示注入评测。
+
+## 会话与记忆安全 V2
+
+V2 将长期偏好、短期历史与执行权限分别处理。不同买家的历史、缓存、偏好、订单及事件沿用身份归属隔离；同一买家的稳定偏好允许跨会话复用，消息和摘要按会话保存。多用户边界在配置 `BUYER_API_KEYS_JSON` 的独立登录模式下验证。
+
+- **结构化偏好：** 写入仅接受预算及币种、材质、品类、品牌、颜色、风格、收货国家等受校验业务字段。所属买家、来源会话与时间由服务端注入，模型不能填写；已知旧短句兼容规范化，未知旧记录保留在库中但不进入提示、缓存作用域或推荐理由，仍可按原文删除。属性词表有明确范围，新增品牌或材质需扩展业务词表。
+- **可追溯摘要：** 压缩模型只能选择原消息的原文摘录，角色和消息编号由服务端确定。无法核对的模型输出回退为有界原文；滚动压缩保留来源，避免凭空生成订单号、金额或批准状态。摘要是历史主张，不产生交易授权。
+- **上下文角色边界：** 主 Agent、planner、子 Agent 使用固定系统规则；动态摘要、偏好及任务背景放进标记为 `untrusted_history` 的 JSON 数据消息。旧 Checkpoint 中的系统/开发者消息也会降为历史数据；这降低角色误提升风险，实际权限仍由 V1 工具边界控制。
+
+`p17_0001` 增加可空的结构化偏好字段。新库、旧库升级和重复升级已验证，旧偏好文本不被删除或批量改写；启动建表路径也补齐缺失列。手动迁移可运行 `python scripts/migrate.py`，已有无版本库使用 `--auto-stamp`。
+
+V2 专项回归：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_preference_security.py tests/test_summary_security.py tests/test_context_trust_boundary.py tests/test_conversation_isolation.py tests/test_memory_migrations.py tests/test_identity_padding.py -q
+```
+
+迁移测试需要 `TEST_MYSQL_URL` 指向独立测试库。验证覆盖真实 Checkpoint 并发、相同检索向量下的缓存归属、SSE 事件路由、偏好复用与多轮伪造批准后的订单/库存状态。真实模型少量冒烟与确定性回归分别记录，均不等于通用注入防御成功率。
 

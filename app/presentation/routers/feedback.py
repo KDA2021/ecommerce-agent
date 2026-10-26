@@ -10,7 +10,9 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.domain.feedback.feedback import UserFeedback
+from app.presentation.auth import principal
 from app.presentation.dependencies import COMMERCE_AUTH, get_container
+from app.presentation.ownership import authorize_session
 
 
 class FeedbackRequest(BaseModel):
@@ -47,6 +49,10 @@ def build_feedback_router() -> APIRouter:
         Raises:
             HTTPException: 存储未就绪返回 503；参数非法返回 422。
         """
+        await authorize_session(request, body.session_id)
+        user = principal(request)
+        if user is not None:
+            body = body.model_copy(update={"buyer_id": user.buyer_id})
         container = get_container(request)
         store = getattr(container, "feedback_store", None) if container is not None else None
         if store is None:
@@ -91,6 +97,7 @@ def build_feedback_router() -> APIRouter:
         Raises:
             HTTPException: 存储未就绪返回 503。
         """
+        await authorize_session(request, session_id)
         container = get_container(request)
         store = getattr(container, "feedback_store", None) if container is not None else None
         if store is None:

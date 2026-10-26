@@ -2,11 +2,14 @@
 """MySQL 实现 PreferenceStore 端口。"""
 from __future__ import annotations
 
-from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
+from datetime import datetime, timezone
+
+from sqlalchemy import LargeBinary, cast, delete, select
+from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.domain.buyer.preference import BuyerPreference, PreferenceStore
+from app.domain.buyer.preference_facts import safe_preference
 from app.infrastructure.persistence.tables import BuyerPreferenceRow
 
 
@@ -27,17 +30,31 @@ class MySqlPreferenceStore(PreferenceStore):
         Args:
             preference: 买家偏好。
         """
+        safe = safe_preference(preference)
+        if (
+            safe is None or not preference.attribute or preference.value is None
+            or not preference.buyer_id or len(preference.buyer_id) > 64
+            or not preference.source_session_id or len(preference.source_session_id) > 191
+        ):
+            raise ValueError("只能保存带会话来源的结构化商品偏好")
+        now = datetime.now(timezone.utc).isoformat()
+        values = dict(
+            buyer_id=safe.buyer_id, kind=safe.kind, statement=safe.statement,
+            created_at=now, attribute=safe.attribute, value=safe.value,
+            currency=safe.currency, source_session_id=safe.source_session_id,
+            updated_at=now,
+        )
+        statement = insert(BuyerPreferenceRow).values(**values)
+        # Retain the first creation time while refreshing server provenance on
+        # an explicit repeat. The existing buyer/kind/canonical-statement unique
+        # key serializes concurrent duplicate writes.
+        statement = statement.on_duplicate_key_update(**{
+            name: values[name] for name in
+            ("attribute", "value", "currency", "source_session_id", "updated_at")
+        })
         async with self._sessions() as db:
-            db.add(BuyerPreferenceRow(
-                buyer_id=preference.buyer_id,
-                kind=preference.kind,
-                statement=preference.statement,
-                created_at=preference.created_at,
-            ))
-            try:
-                await db.commit()
-            except IntegrityError:
-                await db.rollback()
+            await db.execute(statement)
+            await db.commit()
 
     async def list_by_buyer(self, buyer_id: str) -> list[BuyerPreference]:
         """按自增 id 升序列出该买家的偏好。
@@ -51,11 +68,15 @@ class MySqlPreferenceStore(PreferenceStore):
         async with self._sessions() as db:
             rows = (await db.scalars(
                 select(BuyerPreferenceRow)
-                .where(BuyerPreferenceRow.buyer_id == buyer_id)
+                .where(cast(BuyerPreferenceRow.buyer_id, LargeBinary) == buyer_id.encode("utf-8"))
                 .order_by(BuyerPreferenceRow.id),
             )).all()
         return [
-            BuyerPreference(buyer_id=r.buyer_id, kind=r.kind, statement=r.statement, created_at=r.created_at)
+            BuyerPreference(
+                buyer_id=r.buyer_id, kind=r.kind, statement=r.statement, created_at=r.created_at,
+                attribute=r.attribute, value=r.value, currency=r.currency,
+                source_session_id=r.source_session_id, updated_at=r.updated_at,
+            )
             for r in rows
         ]
 
@@ -72,8 +93,8 @@ class MySqlPreferenceStore(PreferenceStore):
         async with self._sessions() as db:
             result = await db.execute(
                 delete(BuyerPreferenceRow).where(
-                    BuyerPreferenceRow.buyer_id == buyer_id,
-                    BuyerPreferenceRow.statement == statement,
+                    cast(BuyerPreferenceRow.buyer_id, LargeBinary) == buyer_id.encode("utf-8"),
+                    cast(BuyerPreferenceRow.statement, LargeBinary) == statement.encode("utf-8"),
                 ),
             )
             await db.commit()

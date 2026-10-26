@@ -88,16 +88,31 @@ class OrderItemRow(Base):
     quantity: Mapped[int] = mapped_column(Integer)        # 数量
 
 
+class ShoppingSessionRow(Base):
+    """An immutable owner binding, shared by all web and worker processes."""
+
+    __tablename__ = "shopping_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(191, collation="utf8mb4_bin"), primary_key=True)
+    buyer_id: Mapped[str] = mapped_column(String(64, collation="utf8mb4_bin"), index=True)
+
+
 class BuyerPreferenceRow(Base):
     """buyer_preferences 表：买家长期偏好，buyer + kind + statement 唯一。"""
 
     __tablename__ = "buyer_preferences"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)  # 自增主键
-    buyer_id: Mapped[str] = mapped_column(String(64), index=True)  # 买家 id
+    buyer_id: Mapped[str] = mapped_column(String(64, collation="utf8mb4_bin"), index=True)  # 买家 id
     kind: Mapped[str] = mapped_column(String(16))                  # 偏好类型：like / dislike
     statement: Mapped[str] = mapped_column(String(255))            # 偏好陈述
     created_at: Mapped[str] = mapped_column(String(40))            # 创建时间（ISO 字符串）
+
+    attribute: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    value: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    currency: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    source_session_id: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
+    updated_at: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
 
     __table_args__ = (
         # 同一买家的同类偏好陈述去重。
@@ -111,7 +126,7 @@ class UserFeedbackRow(Base):
     __tablename__ = "user_feedback"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)  # 自增主键
-    session_id: Mapped[str] = mapped_column(String(191), index=True)   # 会话 id
+    session_id: Mapped[str] = mapped_column(String(191, collation="utf8mb4_bin"), index=True)   # 会话 id
     trace_id: Mapped[str] = mapped_column(String(64), default="", index=True)  # 该轮请求 trace id
     buyer_id: Mapped[str] = mapped_column(String(64), default="", index=True)  # 买家 id（可空串）
     query: Mapped[str] = mapped_column(Text, default="")               # 本轮用户问题
@@ -131,7 +146,7 @@ class SessionMetricsRow(Base):
     __tablename__ = "session_metrics"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)  # 自增主键
-    session_id: Mapped[str] = mapped_column(String(191), index=True)   # 会话 id
+    session_id: Mapped[str] = mapped_column(String(191, collation="utf8mb4_bin"), index=True)   # 会话 id
     trace_id: Mapped[str] = mapped_column(String(64), default="", index=True)  # 请求级 trace id
     turns: Mapped[int] = mapped_column(Integer, default=1)             # 本轮计入的轮数（通常 1）
     llm_calls: Mapped[int] = mapped_column(Integer, default=0)         # 本轮 LLM 调用次数

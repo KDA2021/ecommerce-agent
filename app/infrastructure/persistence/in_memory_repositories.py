@@ -31,6 +31,7 @@ class InMemoryProductRepository(ProductRepository):
         """
         seed = products if products is not None else build_seed_products()
         self._products: dict[str, Product] = {p.product_id: p for p in seed}
+        self._transaction_lock = threading.Lock()
 
     async def find_by_id(self, product_id: str) -> Optional[Product]:
         """按 ID 查询。
@@ -99,6 +100,14 @@ class InMemoryOrderRepository(OrderRepository):
         # 取号与“已用最大号”推进都必须在同一把锁里完成。
         self._counter_lock = threading.Lock()
         self._next_sequence = 1
+
+    def transaction_factory(self, product_repo):
+        from app.infrastructure.persistence.in_memory_transactions import (
+            InMemoryOrderTransactionFactory,
+        )
+        if not isinstance(product_repo, InMemoryProductRepository):
+            raise ValueError("In-memory orders require in-memory product transactions")
+        return InMemoryOrderTransactionFactory(product_repo, self)
 
     def _advance_sequence_past(self, order_id: str) -> None:
         """把内存序列推进到 ``order_id`` 之后，避免手工注入的订单号被重复发出。

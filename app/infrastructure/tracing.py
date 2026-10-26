@@ -7,14 +7,13 @@
 P8 在事件 trace 之上增加 span：``span(name, attrs=None)`` 是异步上下文管理器，
 自动维护 ``contextvars`` 父子栈，退出时追加一行 span JSONL。
 
-P11-3 脱敏：query / reply 等会话文本字段只落 ``sha256[:16] + 长度``，避免把买家
-原话与回复明文写进本地 trace；事件 payload 与 span attrs 都走同一套规则，
-tool / status / span 等结构化字段保持不变。
+query / reply / token 等会话文本字段只落 ``sha256[:16] + 长度``；凭据、收货信息和
+可识别敏感值同样递归脱敏。事件 payload 与 span attrs 都走同一策略，普通工具名、
+状态和数值指标保持可读。脱敏作用于副本，不改变 SSE 的源 payload。
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import time
 import uuid
@@ -24,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from app.application.data_policy import TRACE_TEXT_FIELDS, DataPolicy, text_fingerprint
 from app.application.metrics.session_metrics import record_span as record_metric_span
 from app.infrastructure.context import ShoppingContext
 
@@ -36,7 +36,7 @@ def _safe_session_id(session_id: str) -> str:
 
 #: 需要脱敏的字段名（大小写不敏感）：这些字段的值属于用户会话文本。
 #: 其余字段（tool / status / span / order 等结构化信息）原样保留。
-REDACTED_FIELDS = frozenset({"query", "reply", "matched_query", "reply_preview"})
+REDACTED_FIELDS = TRACE_TEXT_FIELDS
 
 
 def redact_text(text: str) -> dict:
@@ -48,17 +48,14 @@ def redact_text(text: str) -> dict:
     Returns:
         脱敏标记 dict；哈希基于 UTF-8 编码，长度按字符数统计。
     """
-    return {
-        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-        "length": len(text),
-    }
+    return text_fingerprint(text)
 
 
-def redact_sensitive(value: Any) -> Any:
-    """递归脱敏 payload / attrs 中命中 :data:`REDACTED_FIELDS` 的字符串值。
+def redact_sensitive(value: Any, data_policy=None) -> Any:
+    """用独立 trace 策略递归脱敏 payload / attrs。
 
-    只替换命中字段名的字符串，dict 层级、list 顺序、工具名 / status 等结构化
-    字段原样保留；始终返回新对象，绝不原地修改调用方字典——同一个 payload
+    会话文本、凭据及可识别敏感值替换为指纹；dict 层级、list 顺序及普通结构化
+    字段保持不变。始终返回新对象，绝不原地修改调用方字典——同一个 payload
     还要投递给 SSE 客户端，不能被 trace 脱敏污染。
 
     Args:
@@ -67,21 +64,8 @@ def redact_sensitive(value: Any) -> Any:
     Returns:
         脱敏后的新结构。
     """
-    if isinstance(value, dict):
-        redacted: dict = {}
-        for key, item in value.items():
-            if (
-                isinstance(key, str)
-                and key.lower() in REDACTED_FIELDS
-                and isinstance(item, str)
-            ):
-                redacted[key] = redact_text(item)
-            else:
-                redacted[key] = redact_sensitive(item)
-        return redacted
-    if isinstance(value, (list, tuple)):
-        return [redact_sensitive(item) for item in value]
-    return value
+    policy = data_policy if data_policy is not None else DataPolicy()
+    return policy.redact_trace(value)
 
 
 @dataclass
@@ -132,13 +116,14 @@ class LocalTraceLogger:
     给 ``EventBroker.publish`` 这类同步方法用。落盘失败只吞掉异常，绝不阻断主流程。
     """
 
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(self, data_dir: str | Path, data_policy=None) -> None:
         """初始化 trace 目录。
 
         Args:
             data_dir: 数据根目录。
         """
         self.data_dir = Path(data_dir)
+        self.data_policy = data_policy if data_policy is not None else DataPolicy()
         self.trace_dir = self.data_dir / "traces"
         # 用 ContextVar 而非全局 list：父子 span 栈在并发协程间天然隔离。
         self._span_stack: ContextVar[list[str]] = ContextVar(
@@ -158,7 +143,7 @@ class LocalTraceLogger:
         return self.trace_dir / f"{_safe_session_id(session_id)}.jsonl"
 
     @staticmethod
-    def build_line(trace_id: str, event_type: str, payload: dict) -> dict:
+    def build_line(trace_id: str, event_type: str, payload: dict, data_policy=None) -> dict:
         """构造一行 trace：ts / trace_id / type / payload（payload 已脱敏）。
 
         Args:
@@ -173,7 +158,7 @@ class LocalTraceLogger:
             "ts": time.time(),
             "trace_id": trace_id,
             "type": event_type,
-            "payload": redact_sensitive(payload),
+            "payload": redact_sensitive(payload, data_policy),
         }
 
     @asynccontextmanager
@@ -225,7 +210,7 @@ class LocalTraceLogger:
                 "name": name,
                 "duration_ms": handle.duration_ms,
                 "status": handle.status if handle.status in ("ok", "error") else "ok",
-                "attrs": redact_sensitive(handle.attrs),
+                "attrs": redact_sensitive(handle.attrs, self.data_policy),
                 "started_at": handle.started_at,
                 "ended_at": handle.ended_at,
             }
@@ -243,7 +228,7 @@ class LocalTraceLogger:
             event_type: 事件类型。
             payload: 事件载荷。
         """
-        line = self.build_line(trace_id, event_type, payload)
+        line = self.build_line(trace_id, event_type, payload, self.data_policy)
         await asyncio.to_thread(self._append, self.path_for(session_id), line)
 
     def record_nowait(self, session_id: str, trace_id: str, event_type: str, payload: dict) -> None:
@@ -258,7 +243,7 @@ class LocalTraceLogger:
         try:
             self._append(
                 self.path_for(session_id),
-                self.build_line(trace_id, event_type, payload),
+                self.build_line(trace_id, event_type, payload, self.data_policy),
             )
         except Exception:  # noqa: BLE001 - trace 是旁路能力，失败不能影响业务
             pass

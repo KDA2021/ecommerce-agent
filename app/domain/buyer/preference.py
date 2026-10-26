@@ -23,6 +23,11 @@ class BuyerPreference:
     kind: str  # like / dislike
     statement: str  # 一句话偏好陈述，如"不要塑料材质"
     created_at: str = ""
+    attribute: str | None = None
+    value: str | None = None
+    currency: str | None = None
+    source_session_id: str | None = None
+    updated_at: str | None = None
 
     def __post_init__(self) -> None:
         """校验 kind 与 statement，缺省时补创建时间。"""

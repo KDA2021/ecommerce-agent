@@ -567,3 +567,36 @@ def test_preference_hint_is_injected_into_agent_query_not_cache_key():
     assert "收货国家 US" in agent_query
     # 缓存 key 仍是用户原句：chips 不该把同一句话拆成多个缓存条目。
     assert container.semantic_cache.lookups[0][1] == "推荐旅行三件套"
+
+async def test_quarantined_legacy_preference_never_leaks_through_recommendation_reasons():
+    """Matching product words must not bypass whole-statement memory validation."""
+    store = _FakePreferenceStore(["喜欢小众设计!!!"])
+    product = _product("P-SAFE", "小众设计旅行包", description="小众设计 旅行 包", highlights=[], ships_to=["CN"])
+    usecase = CatalogSearchUseCase(product_repo=InMemoryProductRepository([product]), preference_store=store)
+    token = _context()
+    try:
+        result = await usecase.execute(ProductSearchSpec(normalized_query="小众设计", top_k=5))
+    finally:
+        ShoppingContext.reset(token)
+    assert result["hits"]
+    assert all(REASON_PREFERENCE_MATCH not in _codes(hit) for hit in result["hits"])
+    assert "喜欢小众设计!!!" not in str(result)
+
+
+async def test_recommendation_reasons_regenerate_structured_preference_statement():
+    """Facts may be safe even when legacy display text was tampered with."""
+    store = _FakePreferenceStore([])
+    store._preferences = [BuyerPreference(
+        BUYER, "like", "喜欢小众设计!!!", attribute="style", value="小众设计",
+    )]
+    product = _product("P-SAFE", "小众设计旅行包", description="小众设计 旅行 包", highlights=[], ships_to=["CN"])
+    usecase = CatalogSearchUseCase(product_repo=InMemoryProductRepository([product]), preference_store=store)
+    token = _context()
+    try:
+        result = await usecase.execute(ProductSearchSpec(normalized_query="小众设计", top_k=5))
+    finally:
+        ShoppingContext.reset(token)
+    assert result["hits"]
+    matched = [reason["matched_preference"] for reason in result["hits"][0]["reasons"] if reason["code"] == REASON_PREFERENCE_MATCH]
+    assert matched == ["喜欢小众设计"]
+    assert "喜欢小众设计!!!" not in str(result)

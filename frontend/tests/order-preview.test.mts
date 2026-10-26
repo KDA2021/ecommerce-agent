@@ -20,6 +20,7 @@ import {
   parseCreateOrderInvocation,
   parseOrderPreview,
   parseOrderToolResult,
+  resultMatchesPreview,
   verificationBadge,
 } from "../src/orderPreview.ts";
 
@@ -168,7 +169,7 @@ test("applyPreviewAction 确认前不产出任何动作（后端仍在挂起等�
 test("applyPreviewAction 点击确认产出 confirm_order（带 token 调 /commerce/orders/confirm）", () => {
   const preview = { state: PREVIEW_STATE.PENDING, order_id: "", token: "tok-1" };
   const decided = applyPreviewAction(preview, "confirm");
-  assert.equal(decided.state, "confirmed");
+  assert.equal(decided.state, "submitting");
   assert.deepEqual(decided.action, {
     type: "confirm_order",
     token: "tok-1",
@@ -179,7 +180,7 @@ test("applyPreviewAction 点击确认产出 confirm_order（带 token 调 /comme
 test("applyPreviewAction 点击取消产出 cancel_order（不触发下单）", () => {
   const preview = { state: PREVIEW_STATE.PENDING, order_id: "", token: "tok-2" };
   const decided = applyPreviewAction(preview, "cancel");
-  assert.equal(decided.state, "cancelled");
+  assert.equal(decided.state, "submitting");
   assert.deepEqual(decided.action, {
     type: "cancel_order",
     token: "tok-2",
@@ -260,6 +261,60 @@ test("buildPreviewFromOrderPreview 渲染商品 / SKU / 数量 / 地址且不编
   assert.match(card.address_text, /杭州/);
   assert.equal(card.amount_known, false);
   assert.equal(card.total_major, undefined);
+});
+
+test("cancel_order preview preserves operation, trusted order, and requested reason", () => {
+  const event = {tool: "cancel_order", token: "cancel-token", trace_id: "cancel-trace",
+    preview: {order_id: RESULT_ORDER.order_id, reason: "改买其他款", order: RESULT_ORDER}};
+  const parsed = parseOrderPreview(event);
+  assert.ok(parsed);
+  assert.equal(parsed.tool, "cancel_order");
+  assert.equal(parsed.preview.order_id, RESULT_ORDER.order_id);
+  const card = buildPreviewFromOrderPreview(event);
+  assert.ok(card);
+  assert.equal(card.source, "preview");
+  assert.equal(card.order_id, RESULT_ORDER.order_id);
+  assert.equal(card.status, "CONFIRMED");
+  assert.equal(card.total_major, 199.8);
+  assert.equal(card.cancel_reason, "改买其他款");
+});
+
+test("cancel_order preview rejects absent token, snapshot, or mismatched order id", () => {
+  const event = {tool: "cancel_order", token: "cancel-token",
+    preview: {order_id: RESULT_ORDER.order_id, reason: "", order: RESULT_ORDER}};
+  assert.ok(parseOrderPreview(event));
+  assert.equal(parseOrderPreview({...event, token: ""}), null);
+  assert.equal(parseOrderPreview({...event, preview: {order_id: RESULT_ORDER.order_id}}), null);
+  assert.equal(parseOrderPreview({...event, preview: {...event.preview, order_id: "wrong"}}), null);
+});
+
+test("findResultForTrace can correlate cancellation without preferring earlier create/query results", () => {
+  const cancelled = {...RESULT_ORDER, status: "CANCELLED"};
+  const events = [
+    {event: "tool.result", payload: {trace_id: "t", tool: "create_order", order: RESULT_ORDER}},
+    {event: "tool.result", payload: {trace_id: "t", tool: "query_order", order: RESULT_ORDER}},
+    {event: "tool.result", payload: {trace_id: "t", tool: "cancel_order", order: cancelled}},
+  ];
+  assert.deepEqual(findResultForTrace(events, "t", "cancel_order"), cancelled);
+});
+
+test("cancellation result correlation requires the current token and target order", () => {
+  const target = {operation:"cancel_order",token:"token-B",order_id:"B"} as const;
+  assert.equal(resultMatchesPreview({tool:"cancel_order",confirmation_token:"token-A",order:{order_id:"A"}}, target), false);
+  assert.equal(resultMatchesPreview({tool:"cancel_order",confirmation_token:"token-A",order:{order_id:"B"}}, target), false);
+  assert.equal(resultMatchesPreview({tool:"cancel_order",confirmation_token:"token-B",order:{order_id:"A"}}, target), false);
+  assert.equal(resultMatchesPreview({tool:"cancel_order",confirmation_token:"token-B",error:"execution failed"}, target), true);
+  assert.equal(resultMatchesPreview({tool:"cancel_order",order:{order_id:"A"}}, target), false);
+  assert.equal(resultMatchesPreview({tool:"cancel_order",order:{order_id:"B"}}, target), true);
+  assert.equal(resultMatchesPreview({tool:"cancel_order",error:"unidentified failure"}, target), false);
+});
+
+test("historical cancellation lookup rejects a result for another target or earlier token", () => {
+  const old = {...RESULT_ORDER, status:"CANCELLED"};
+  const events = [{event:"tool.result",payload:{tool:"cancel_order",trace_id:"t",confirmation_token:"old",order:old}}];
+  assert.equal(findResultForTrace(events,"t","cancel_order",{token:"new",order_id:"GBX-NEW"}), null);
+  assert.equal(findResultForTrace(events,"t","cancel_order",{token:"new",order_id:RESULT_ORDER.order_id}), null);
+  assert.deepEqual(findResultForTrace(events,"t","cancel_order",{token:"old",order_id:RESULT_ORDER.order_id}), old);
 });
 
 test("order.preview 载荷不含单价（后端只回传已知信息）", () => {

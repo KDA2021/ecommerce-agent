@@ -552,7 +552,10 @@ def test_intents_direct_mode_still_runs_agent():
     assert body["reply"] == "测试回复"
     assert body["task_id"] == ""
     assert body["status"] == ""
-    assert container.broker.events == [("s-test", "final.result", {"reply": "测试回复"})]
+    assert body["trace_id"]
+    assert container.broker.events == [("s-test", "final.result", {
+        "reply": "测试回复", "trace_id": body["trace_id"], "client_request_id": "",
+    })]
 
 
 # ======================================================================

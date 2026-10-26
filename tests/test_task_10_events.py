@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -92,7 +93,7 @@ async def test_order_tools_publish_invoke_and_order_snapshot():
             return {"order_id": order_id, "status": "CANCELLED", "cancel_reason": reason}
 
     broker = _Broker()
-    tools = build_order_tools(_Place(), _Query(), _Cancel(), broker=broker)
+    tools = build_order_tools(_Place(), _Query(), _Cancel(), broker=broker, require_confirmation=False)
     by_name = {tool.name: tool for tool in tools}
     token = _context()
     try:
@@ -124,6 +125,7 @@ async def test_order_tools_publish_invoke_and_order_snapshot():
     assert broker.events[1][2] == {
         "tool": "create_order",
         "order": {"order_id": "GBX-000001", "status": "CONFIRMED"},
+        "confirmation_token": None,
     }
     assert broker.events[2][2] == {"tool": "query_order", "args": {"order_id": "GBX-000001"}}
     assert broker.events[3][2] == {
@@ -191,7 +193,7 @@ async def test_build_main_graph_accepts_broker_and_publishes_compression_event()
     )
     token = _context()
     try:
-        await graph.ainvoke(
+        result = await graph.ainvoke(
             {
                 "messages": [
                     AIMessage(content="很长的历史" * 50),
@@ -206,5 +208,9 @@ async def test_build_main_graph_accepts_broker_and_publishes_compression_event()
     compressed = [event for event in broker.events if event[1] == "context.compressed"]
     assert len(compressed) == 1
     payload = compressed[0][2]
-    assert payload["summary_length"] == len("直接回答")
+    assert payload["summary_length"] == len(result["summary"])
+    summary = json.loads(result["summary"])
+    assert summary["authority"] == "historical_data_only"
+    assert summary["entries"][0]["source_role"] == "ai"
+    assert summary["entries"][0]["text"] == "很长的历史" * 50
     assert payload["removed_messages"] == 1

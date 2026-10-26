@@ -223,7 +223,7 @@ class _BarrierSearchLlm:
         finally:
             self.active -= 1
         instruction = next(
-            (str(m.content) for m in snapshot if isinstance(m, HumanMessage)), ""
+            (str(m.content) for m in reversed(snapshot) if isinstance(m, HumanMessage)), ""
         )
         return AIMessage(content=f"检索完成：{instruction}")
 

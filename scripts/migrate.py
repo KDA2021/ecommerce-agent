@@ -77,7 +77,7 @@ async def database_has_app_tables(database_url: str) -> bool:
             tables = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
     finally:
         await engine.dispose()
-    return bool(set(tables) & app_table_names())
+    return "alembic_version" not in tables and bool(set(tables) & app_table_names())
 
 
 def run_migrations(
@@ -112,7 +112,7 @@ def ensure_schema_at_head(database_url: Optional[str] = None) -> str:
     分两种情况：
     1. **空库 / 已有 alembic_version**：直接 ``upgrade head``。
     2. **有业务表但没有 alembic_version**（开发/测试走 ``bootstrap_schema``）：
-       先把当前结构标记为 ``stamp head`` 基线，再 ``upgrade head``。
+       先标记 ``p11_0001`` 初始基线，再依次运行后续增量迁移。
        否则初始迁移的 ``CREATE TABLE`` 会因为表已存在而失败。
 
     Args:
@@ -123,14 +123,13 @@ def ensure_schema_at_head(database_url: Optional[str] = None) -> str:
     """
     url = database_url or load_settings().database_url
     if asyncio.run(database_has_app_tables(url)):
-        # 库非空：说明结构来自 create_all/bootstrap，先把当前结构记为 head 基线。
-        # stamp 只写 alembic_version，不改任何表结构；然后 upgrade head 到最新。
+        # stamp 初始基线只写版本号，后续增量迁移仍会检查并补齐缺失结构。
         print(
             "[migrate] 检测到已有业务表但没有 Alembic 版本记录："
-            "先 stamp head 记录基线（bootstrap_schema 兼容路径）。",
+            "先 stamp p11_0001 记录初始基线，再运行后续迁移。",
             file=sys.stderr,
         )
-        run_migrations(url, "head", action="stamp")
+        run_migrations(url, "p11_0001", action="stamp")
     run_migrations(url, "head", action="upgrade")
     return url
 

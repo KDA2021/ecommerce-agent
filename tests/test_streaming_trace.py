@@ -78,7 +78,7 @@ class LegacyAgent:
 # --------------------------------------------------------------------------- #
 
 
-async def test_invoke_agent_stream_publishes_non_empty_token_delta():
+async def test_invoke_agent_stream_publishes_only_final_state_after_buffering():
     agent = FakeStreamAgent(["旅", "行", "", "三件套"])
     broker = RecordingBroker()
 
@@ -87,18 +87,20 @@ async def test_invoke_agent_stream_publishes_non_empty_token_delta():
     assert reply == "最终回答"
     assert agent.calls[0][1] == {"configurable": {"thread_id": "s-stream"}}
     assert agent.calls[0][2] == "v2"
-    assert [event[1] for event in broker.events] == ["token.delta"] * 3
-    assert [event[2]["token"] for event in broker.events] == ["旅", "行", "三件套"]
+    # Intermediate model chunks may contain private reasoning or split credentials.
+    # The new contract releases the sanitized final state once, matching final.result.
+    assert [event[1] for event in broker.events] == ["token.delta"]
+    assert [event[2]["token"] for event in broker.events] == [reply]
     assert all(event[0] == "s-stream" for event in broker.events)
 
 
-async def test_invoke_agent_stream_normalizes_list_content():
+async def test_invoke_agent_stream_keeps_list_intermediate_content_private():
     agent = FakeStreamAgent([[{"type": "text", "text": "你"}], "好"])
     broker = RecordingBroker()
 
     await invoke_agent_stream(agent, "s1", "hi", broker)
 
-    assert [event[2]["token"] for event in broker.events] == ["你", "好"]
+    assert [event[2]["token"] for event in broker.events] == ["最终回答"]
 
 
 async def test_invoke_agent_stream_works_without_broker():
@@ -167,7 +169,9 @@ async def test_local_trace_logger_writes_jsonl_lines(tmp_path):
     assert len(lines) == 2
     assert lines[0]["trace_id"] == "trace-1"
     assert lines[0]["type"] == "token.delta"
-    assert lines[0]["payload"] == {"token": "你"}
+    assert lines[0]["payload"] == {"token": {
+        "sha256": hashlib.sha256("你".encode("utf-8")).hexdigest()[:16], "length": 1,
+    }}
     assert isinstance(lines[0]["ts"], float)
     # P11-3：reply 明文不落盘，只留 sha256 前 16 位 + 长度。
     assert lines[1]["payload"] == {
@@ -281,7 +285,10 @@ async def test_event_broker_records_published_events_to_trace(tmp_path):
     ]
     assert [line["type"] for line in lines] == ["token.delta", "final.result"]
     assert all(line["trace_id"] == "trace-9" for line in lines)
-    assert lines[0]["payload"] == {"token": "你", "trace_id": "trace-9"}
+    assert lines[0]["payload"] == {
+        "token": {"sha256": hashlib.sha256("你".encode("utf-8")).hexdigest()[:16], "length": 1},
+        "trace_id": "trace-9",
+    }
 
 
 # --------------------------------------------------------------------------- #

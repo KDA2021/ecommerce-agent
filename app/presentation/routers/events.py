@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from app.presentation.dependencies import COMMERCE_AUTH_AND_RATE_LIMIT, get_container
+from app.presentation.ownership import authorize_session
 
 
 def build_events_router() -> APIRouter:
@@ -34,6 +35,7 @@ def build_events_router() -> APIRouter:
         Returns:
             StreamingResponse。
         """
+        await authorize_session(request, shopping_session_id, claim=True)
         broker = get_container(request).broker
         return StreamingResponse(
             broker.subscribe(shopping_session_id),

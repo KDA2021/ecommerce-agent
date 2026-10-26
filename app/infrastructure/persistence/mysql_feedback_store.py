@@ -2,7 +2,7 @@
 """MySQL 实现 FeedbackStore 端口（user_feedback 表）。"""
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import LargeBinary, cast, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.domain.feedback.feedback import FeedbackStore, UserFeedback
@@ -58,7 +58,7 @@ class MySqlFeedbackStore(FeedbackStore):
         async with self._sessions() as db:
             rows = (await db.scalars(
                 select(UserFeedbackRow)
-                .where(UserFeedbackRow.session_id == session_id)
+                .where(cast(UserFeedbackRow.session_id, LargeBinary) == session_id.encode("utf-8"))
                 .order_by(UserFeedbackRow.id)
                 .limit(max(int(limit), 1)),
             )).all()

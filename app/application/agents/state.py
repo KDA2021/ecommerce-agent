@@ -48,6 +48,7 @@ class MainState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]  # 对话消息，add_messages 负责合并
     subtask: Annotated[dict, _last_update]               # 当前子任务规格；并行分支都会写，需 reducer
     decision: dict                                       # planner 决策（route / reasoning / tasks）
+    user_request: str                                   # 本轮原始请求，避免内部子任务指令取代用户意图
     summary: str                                         # 压缩后的历史摘要
     preference_hint: Annotated[str, _last_update]        # 买家偏好提示；并行 fan-in 需 reducer
     turn_compressed: Annotated[bool, _last_update]       # 本轮是否已压缩；并行写需 reducer

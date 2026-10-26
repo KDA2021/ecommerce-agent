@@ -21,6 +21,8 @@ class ShoppingContextSnapshot:
     locale: str
     currency: str
     trace_id: str = ""
+    task_id: str = ""
+    client_request_id: str = ""
 
 
 _current_snapshot: ContextVar[Optional[ShoppingContextSnapshot]] = ContextVar(

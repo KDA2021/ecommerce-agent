@@ -2,12 +2,18 @@
 """组装容器：数据库/检索/订单用例/工具/Agent 一次装配。"""
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 from app.application.agents.main_graph import build_main_graph
+from app.application.data_policy import DataPolicy
 from app.application.metrics.session_metrics import experiment_config_from_settings
-from app.application.order_confirmation import OrderConfirmationManager
+from app.application.order_confirmation import (
+    OrderConfirmationManager,
+    RedisOrderConfirmationManager,
+)
 from app.application.tools.category_insight_tool import build_category_insight_tool
 from app.application.tools.order_tools import build_order_tools
 from app.application.tools.preference_tools import build_preference_tools
@@ -37,7 +43,9 @@ from app.infrastructure.persistence.mysql_repositories import (
     seed_order_counter,
 )
 from app.infrastructure.persistence.mysql_task_store import MySqlTaskStateStore
+from app.infrastructure.persistence.mysql_transactions import MySqlOrderTransactionFactory
 from app.infrastructure.persistence.seed_products import build_seed_products
+from app.infrastructure.persistence.session_ownership import MySqlSessionOwnershipStore
 from app.infrastructure.queue.redis_stream_queue import RedisStreamTaskQueue
 from app.infrastructure.rag.category_knowledge import CategoryKnowledgeBase
 from app.infrastructure.redis_cache import RedisCache
@@ -95,6 +103,8 @@ class Container:
     confirmation_manager: OrderConfirmationManager  # P10-2 下单确认握手：token → 等待/决议
     experiment_config: dict             # P10-5 当前 A/B 开关快照：Dashboard 展示用
     task_queue: object | None = None    # P11-4 多 worker 队列；QUEUE_MODE=direct 时为 None
+    session_ownership: object | None = None
+    data_policy: DataPolicy | None = None
 
     async def close(self) -> None:
         """释放数据库引擎、checkpointer、Redis 连接与事件背板。"""
@@ -165,7 +175,15 @@ async def build_container(
     else:
         semantic_cache = DisabledSemanticCache()
     # P6：每个 SSE 事件同时落一条本地 JSONL trace（data/traces/{session_id}.jsonl）。
-    trace_logger = LocalTraceLogger(settings.data_dir)
+    secret_values = [settings.llm_api_key, settings.api_key, settings.tavily_api_key]
+    buyer_keys = json.loads(settings.buyer_api_keys_json or "{}")
+    secret_values.extend(buyer_keys.values())
+    for connection_url in (settings.database_url, settings.redis_url):
+        password = urlsplit(connection_url).password
+        if password:
+            secret_values.append(unquote(password))
+    data_policy = DataPolicy(secret_values=tuple(value for value in secret_values if value))
+    trace_logger = LocalTraceLogger(settings.data_dir, data_policy=data_policy)
     # P11-4：QUEUE_MODE=redis 才启用「队列 + 跨实例 SSE 广播」。
     # 默认 direct 时 backplane / task_queue 都是 None，broker 行为与 P11-3 完全一致，
     # 也不会因为 .env 里配了 REDIS_URL 就产生额外的 Pub/Sub 连接（本地开发零负担）。
@@ -199,13 +217,17 @@ async def build_container(
         tracer=trace_logger,
         preference_store=preference_store,
     )
-    place_order = PlaceOrderUseCase(product_repo, order_repo)
+    order_transactions = MySqlOrderTransactionFactory(engine)
+    place_order = PlaceOrderUseCase(product_repo, order_repo, transaction_factory=order_transactions)
     query_order = QueryOrderUseCase(order_repo)
-    cancel_order = CancelOrderUseCase(product_repo, order_repo)
+    cancel_order = CancelOrderUseCase(product_repo, order_repo, transaction_factory=order_transactions)
 
     # P10-2 修复：进程内下单确认握手。create_order 发布 order.preview 后真实挂起，
     # 等前端 POST /commerce/orders/confirm 决议；取消 / 超时绝不落库。
-    confirmation_manager = OrderConfirmationManager()
+    confirmation_manager = (
+        RedisOrderConfirmationManager(redis_cache.client, ttl_seconds=int(settings.order_confirm_timeout_seconds + 60))
+        if queue_mode == "redis" and redis_cache.enabled else OrderConfirmationManager()
+    )
     # 确认等待可能远长于普通工具超时：本工具单独放宽为 confirm_timeout 再留缓冲，
     # 保证 create_order 内部的 manager.wait 先按自己的 timeout 返回取消结果。
     order_confirm_wrapper_timeout = settings.order_confirm_timeout_seconds + ORDER_CONFIRM_TIMEOUT_BUFFER_SECONDS
@@ -222,6 +244,7 @@ async def build_container(
         redis_cache=redis_cache,
         confirmation_manager=confirmation_manager,
         settings=settings,
+        require_confirmation=True,
     )
     category_tool = build_category_insight_tool(category_kb, broker)
     preference_tools = build_preference_tools(preference_store, broker)
@@ -233,6 +256,7 @@ async def build_container(
         web_search_tool = build_web_search_tool(
             TavilySearchClient(tavily_api_key),
             broker=broker,
+            data_policy=data_policy,
         )
     else:
         logger.info("web_search_tool 未注册（未配置 TAVILY_API_KEY）")
@@ -267,7 +291,7 @@ async def build_container(
         _resilient(
             tool,
             timeout_seconds=(
-                order_confirm_wrapper_timeout if tool.name == "create_order" else None
+                order_confirm_wrapper_timeout if tool.name in {"create_order", "cancel_order"} else None
             ),
         )
         for tool in order_tools
@@ -328,6 +352,7 @@ async def build_container(
     experiment_config = experiment_config_from_settings(settings)
 
     return Container(
+        data_policy=data_policy,
         settings=settings,
         product_repo=product_repo,
         order_repo=order_repo,
@@ -354,4 +379,5 @@ async def build_container(
         confirmation_manager=confirmation_manager,
         experiment_config=experiment_config,
         task_queue=task_queue,
+        session_ownership=MySqlSessionOwnershipStore(engine),
     )

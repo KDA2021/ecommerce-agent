@@ -9,6 +9,8 @@ import {
   openEvents,
   submitFeedback,
   submitIntent,
+  fetchAuthSession, login, logout, fetchIntentTask,
+  type AuthSession,
   type OrderSnapshot,
 } from "./api";
 import { ChatPanel } from "./components/ChatPanel";
@@ -56,7 +58,10 @@ import {
   extractEvidence,
   findResultForTrace,
   parseCreateOrderInvocation,
+  parseOrderPreview,
   parseOrderToolResult,
+  resultMatchesPreview,
+  type OrderOperation,
   type OrderCard,
 } from "./orderPreview";
 import {
@@ -102,14 +107,56 @@ function extractHits(payload: unknown): ProductHit[] {
 }
 
 export default function App() {
+  const [auth, setAuth] = useState<AuthSession | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [error, setError] = useState("");
+  const [working, setWorking] = useState(false);
+  const [demoBuyer, setDemoBuyer] = useState("buyer-1");
+  const [epoch, setEpoch] = useState(0);
+  function refresh() {
+    setError("");
+    void fetchAuthSession().then(setAuth).catch((e) => setError(String(e.message)));
+  }
+  useEffect(refresh, []);
+  async function authenticate(event: FormEvent) {
+    event.preventDefault();
+    setWorking(true); setError("");
+    try { setAuth(await login(apiKey)); setApiKey(""); setEpoch(n => n + 1); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setWorking(false); }
+  }
+  async function signOut() {
+    // Unmount first: close SSE and discard all in-flight callbacks before changing identity.
+    setWorking(true); setError("");
+    try { setAuth(await logout()); setEpoch(n => n + 1); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setWorking(false); }
+  }
+  if (!auth || working || (auth.auth_required && !auth.buyer_id)) return (
+    <main style={styles.page}>
+      <h1 style={styles.title}>ecommerce-agent</h1>
+      {!auth ? <p>正在连接 / Connecting…</p> : !working && <form onSubmit={authenticate} style={styles.composer}>
+        <label>访问密钥 / Access key <input data-testid="access-key" type="password" autoComplete="off" value={apiKey} onChange={e => setApiKey(e.target.value)} style={styles.input} /></label>
+        <button style={styles.button} disabled={!apiKey.trim()} type="submit">登录 / Sign in</button>
+      </form>}
+      {working && <p>正在处理 / Please wait…</p>}
+      {error && <div role="alert">{error}{!auth && <button onClick={refresh}>重试 / Retry</button>}</div>}
+    </main>
+  );
+  return <CommerceApp key={`${epoch}:${auth.buyer_id ?? demoBuyer}`} auth={auth} initialBuyer={demoBuyer} onBuyerChange={setDemoBuyer} onLogout={() => void signOut()} />;
+}
+
+function CommerceApp({auth, initialBuyer, onBuyerChange, onLogout}: {auth: AuthSession; initialBuyer: string; onBuyerChange: (buyer: string) => void; onLogout: () => void}) {
   const [path, setPath] = useState(currentPath);
-  const [buyerId, setBuyerId] = useState("buyer-1");
+  const buyerId = auth.buyer_id ?? initialBuyer;
+  const [buyerDraft, setBuyerDraft] = useState(buyerId);
+  const storeKey = `${SESSION_STORE_KEY}:${auth.auth_required ? "buyer" : "demo"}:${encodeURIComponent(buyerId)}`;
   const [lang, setLang] = useState<Lang>(() =>
     detectLang(readStorage(LANG_STORAGE_KEY), typeof navigator === "undefined" ? "" : navigator.language),
   );
   // 启动时恢复 localStorage 里的最近会话：能恢复就恢复，不能就开新会话。
   const [boot] = useState(() => {
-    const restored = parseSessionStore(readStorage(SESSION_STORE_KEY));
+    const restored = parseSessionStore(readStorage(storeKey));
     if (restored.length > 0) {
       return { sessions: restored, sessionId: restored[0].id, messages: toChatMessages(restored[0].messages) };
     }
@@ -122,7 +169,14 @@ export default function App() {
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
   const [sending, setSending] = useState(false);
   const [downOpenId, setDownOpenId] = useState<string | null>(null);
-  const [orderPreview, setOrderPreview] = useState<OrderPreviewState | null>(null);
+  const [orderPreview, setOrderPreviewState] = useState<OrderPreviewState | null>(null);
+  const orderPreviewRef = useRef<OrderPreviewState | null>(null);
+  // SSE bursts can contain several tool decisions before React renders again.
+  function setOrderPreview(update: OrderPreviewState | null | ((previous: OrderPreviewState | null) => OrderPreviewState | null)) {
+    const next = typeof update === "function" ? update(orderPreviewRef.current) : update;
+    orderPreviewRef.current = next;
+    setOrderPreviewState(next);
+  }
   const [orderLookupId, setOrderLookupId] = useState("");
   const [orderLookupError, setOrderLookupError] = useState("");
   // P10-3：偏好 chips 选择 + 最近的检索对比数据（tool.result 里带 top_picks）。
@@ -134,9 +188,30 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState("");
   const [sseNonce, setSseNonce] = useState(0);
+  const [eventsConnected, setEventsConnected] = useState(false);
   const pendingQueryRef = useRef("");
   const seenEventsRef = useRef<SeenEvent[]>([]);
   const sessionIdRef = useRef(sessionId);
+  const activeRef = useRef<{
+    messageId: string; sessionId: string; query: string; requestId: string; taskId: string; traceId: string;
+    awaitingResponse: boolean; buffer: SeenEvent[];
+    timeout?: ReturnType<typeof setTimeout>; poll?: ReturnType<typeof setTimeout>;
+  } | null>(null);
+  const dispatchEventRef = useRef<(name: string, payload: unknown) => void>(() => {});
+  const retiredTracesRef = useRef(new Set<string>());
+  const mountedRef = useRef(true);
+  function finishRun() {
+    const run = activeRef.current;
+    if (run?.timeout) clearTimeout(run.timeout);
+    if (run?.poll) clearTimeout(run.poll);
+    if (run?.traceId) retiredTracesRef.current.add(run.traceId);
+    activeRef.current = null;
+    setSending(false);
+  }
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; finishRun(); };
+  }, []);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -159,7 +234,7 @@ export default function App() {
         updatedAt: Date.now(),
         messages: toStoredMessages(messages),
       });
-      writeStorage(SESSION_STORE_KEY, serializeSessionStore(next));
+      writeStorage(storeKey, serializeSessionStore(next));
       return next;
     });
   }, [messages, sessionId, lang]);
@@ -172,7 +247,7 @@ export default function App() {
         if (cancelled) return;
         setSessions((prev) => {
           const merged = mergeBackendSessions(prev, list, t(lang, "history.untitled"));
-          writeStorage(SESSION_STORE_KEY, serializeSessionStore(merged));
+          writeStorage(storeKey, serializeSessionStore(merged));
           return merged;
         });
       })
@@ -208,12 +283,14 @@ export default function App() {
     value: string,
     meta?: { traceId?: string; query?: string },
   ) {
+    const messageId = activeRef.current?.messageId;
     setMessages((prev) => {
       const next = [...prev];
 
       for (let index = next.length - 1; index >= 0; index -= 1) {
         const message = next[index];
         if (message.role !== "assistant") continue;
+        if (messageId && message.id !== messageId) continue;
         next[index] = {
           ...message,
           content: mode === "append" ? `${message.content}${value}` : value,
@@ -240,11 +317,13 @@ export default function App() {
    * 其他补丁（订单卡片 / 反馈状态）原样合并。
    */
   function patchLastAssistant(patch: Partial<ChatMessage>) {
+    const messageId = activeRef.current?.messageId;
     setMessages((prev) => {
       const next = [...prev];
       for (let index = next.length - 1; index >= 0; index -= 1) {
         const message = next[index];
         if (message.role !== "assistant") continue;
+        if (messageId && message.id !== messageId) continue;
         if (patch.subagentError) {
           const failure = detectSubagentFailure(message.content);
           next[index] = { ...message, subagentError: failure.failed, subagentDetail: failure.detail };
@@ -311,7 +390,7 @@ export default function App() {
 
   /** 切换会话：本地消息立即恢复；本地为空时再向后端 thread 拉一次。 */
   function switchSession(target: string) {
-    if (target === sessionId) return;
+    if (target === sessionId || activeRef.current) return;
     const stored = sessions.find((session) => session.id === target);
     sessionIdRef.current = target;
     setSessionId(target);
@@ -329,6 +408,7 @@ export default function App() {
   }
 
   function startNewSession() {
+    if (activeRef.current) return;
     const id = newSessionId();
     sessionIdRef.current = id;
     setSessionId(id);
@@ -369,9 +449,10 @@ export default function App() {
   }
 
   function removeStoredSession(id: string) {
+    if (id === sessionId && activeRef.current) return;
     setSessions((prev) => {
       const next = removeSession(prev, id);
-      writeStorage(SESSION_STORE_KEY, serializeSessionStore(next));
+      writeStorage(storeKey, serializeSessionStore(next));
       return next;
     });
     if (id !== sessionId) return;
@@ -384,11 +465,13 @@ export default function App() {
   }
 
   function updateAssistantOrder(card: OrderCard, evidence: ReturnType<typeof extractEvidence>) {
+    const messageId = activeRef.current?.messageId;
     setMessages((prev) => {
       const next = [...prev];
       for (let index = next.length - 1; index >= 0; index -= 1) {
         const message = next[index];
         if (message.role !== "assistant") continue;
+        if (messageId && message.id !== messageId) continue;
         next[index] = { ...message, order: card, orderEvidence: evidence };
         return next;
       }
@@ -397,19 +480,24 @@ export default function App() {
   }
 
   /** 把订单快照落到预览面板 + 消息卡片（含状态 / order_id / 验证徽章）。 */
-  function applyOrderResult(order: OrderSnapshot) {
+  function applyOrderResult(order: OrderSnapshot, operation?: OrderOperation | "query_order", confirmationToken?: string) {
     const card = buildResultCard(order);
     if (!card) return;
     const evidence = extractEvidence(order);
-    const state = evidence.status === "CANCELLED" ? PREVIEW_STATE.CANCELLED : PREVIEW_STATE.CONFIRMED;
-    setOrderPreview((prev) => ({
-      state,
-      order_id: card.order_id,
-      token: prev?.token ?? "",
-      card,
-      hintKey: previewHintKey(state),
-      source: "result",
-    }));
+    const state = ["CANCELLED", "CANCELED"].includes(evidence.status) ? PREVIEW_STATE.CANCELLED : PREVIEW_STATE.CONFIRMED;
+    setOrderPreview((prev) => {
+      // A query is evidence, not approval of the pending cancellation.
+      if (prev?.operation === "cancel_order" && operation !== "cancel_order") return prev;
+      if (prev?.operation === "cancel_order" && prev.order_id !== card.order_id) return prev;
+      const resolvedOperation = operation === "cancel_order" ? operation : "create_order";
+      return {
+        operation: resolvedOperation, state, order_id: card.order_id,
+        token: confirmationToken ?? prev?.token ?? "", card,
+        hintKey: resolvedOperation === "cancel_order" && state === PREVIEW_STATE.CANCELLED
+          ? "order.cancellationCompleteHint" : previewHintKey(state, resolvedOperation),
+        source: "result",
+      };
+    });
     updateAssistantOrder(card, evidence);
     appendTimeline(
       `order.${evidence.status.toLowerCase()}`,
@@ -417,26 +505,30 @@ export default function App() {
     );
   }
 
-  /** order.preview(create_order) → 确认卡片；此时后端已挂起等待 token 决议。 */
+  /** order.preview → 下单或取消确认；后端挂起等待同一确认接口的 token 决议。 */
   function onOrderPreviewEvent(payload: unknown) {
     const card = buildPreviewFromOrderPreview(payload);
     if (!card) return;
-    const record = asRecord(payload);
-    const token = readString(record, "token") ?? "";
-    if (!token) return;
+    const parsed = parseOrderPreview(payload);
+    if (!parsed) return;
+    const {token, tool: operation} = parsed;
     const traceId = eventTraceId(payload);
-    const existing = findResultForTrace(seenEventsRef.current, traceId);
+    const existing = operation === "cancel_order"
+      ? findResultForTrace(seenEventsRef.current, traceId, operation, {token, order_id: card.order_id})
+      : findResultForTrace(seenEventsRef.current, traceId, operation, {token, order_id: ""});
     setOrderPreview((prev) => {
       // 已经拿到结果 / 已确认：不覆盖当前轮状态，避免事件重放把结果打回 PENDING。
-      if (prev && (prev.order_id || prev.state === PREVIEW_STATE.CONFIRMED)) return prev;
-      const orderId = (existing?.order_id as string | undefined) ?? prev?.order_id ?? "";
-      const nextState = existing ? PREVIEW_STATE.CONFIRMED : PREVIEW_STATE.PENDING;
+      if (prev?.token === token) return prev;
+      if (operation === "create_order" && !prev?.token && prev && (prev.order_id || prev.state === PREVIEW_STATE.CONFIRMED)) return prev;
+      const orderId = (existing?.order_id as string | undefined) ?? card.order_id;
+      const nextState = existing ? (["CANCELLED", "CANCELED"].includes(String(existing.status)) ? PREVIEW_STATE.CANCELLED : PREVIEW_STATE.CONFIRMED) : PREVIEW_STATE.PENDING;
       return {
+        operation,
         state: nextState,
         order_id: orderId,
         token,
-        card: { ...card, order_id: orderId },
-        hintKey: previewHintKey(nextState),
+        card: existing ? buildResultCard(existing) ?? card : { ...card, order_id: orderId },
+        hintKey: operation === "cancel_order" && nextState === PREVIEW_STATE.CANCELLED ? "order.cancellationCompleteHint" : previewHintKey(nextState, operation),
         source: existing ? "result" : "preview",
       };
     });
@@ -457,6 +549,7 @@ export default function App() {
       const nextState = foundResult ? PREVIEW_STATE.CONFIRMED : PREVIEW_STATE.PENDING;
       const orderId = (existing?.order_id as string | undefined) ?? prev?.order_id ?? "";
       return {
+        operation: "create_order",
         state: nextState,
         order_id: orderId,
         token: prev?.token ?? "",
@@ -470,8 +563,22 @@ export default function App() {
   /** 提交一轮意图；失败时记录 lastError 供重试。 */
   async function runIntent(text: string, opts: { retry?: boolean } = {}): Promise<void> {
     const trimmed = text.trim();
-    if (!trimmed || sending) return;
+    if (!trimmed || activeRef.current || !buyerId.trim() || !eventsConnected) return;
     const requestSessionId = sessionId;
+    const assistantId = opts.retry ? [...messages].reverse().find(m => m.role === "assistant")?.id ?? newId() : newId();
+    const run = {
+      messageId: assistantId, sessionId, query: trimmed, requestId: crypto.randomUUID(), taskId: "", traceId: "",
+      awaitingResponse: true, buffer: [] as SeenEvent[], timeout: undefined as ReturnType<typeof setTimeout> | undefined,
+      poll: undefined as ReturnType<typeof setTimeout> | undefined,
+    };
+    activeRef.current = run;
+    run.timeout = setTimeout(() => {
+      if (activeRef.current !== run) return;
+      // A browser deadline says nothing about the server task's terminal state.
+      // Keep its identity, busy lock, polling and event subscription until the server settles it.
+      run.timeout = undefined;
+      setLastError({kind: "waiting", message: "仍在处理中，请继续等待任务完成 / Still processing. Please keep waiting for completion."});
+    }, 180_000);
     pendingQueryRef.current = trimmed;
     setLastError(null);
     if (opts.retry) {
@@ -489,22 +596,56 @@ export default function App() {
       setMessages((prev) => [
         ...prev,
         { id: newId(), role: "user", content: trimmed },
-        { id: newId(), role: "assistant", content: "", query: trimmed, feedbackStatus: "idle" },
+        { id: assistantId, role: "assistant", content: "", query: trimmed, feedbackStatus: "idle" },
       ]);
     }
     setSending(true);
     try {
-      const reply = await submitIntent({
+      const submission = await submitIntent({
+        client_request_id: run.requestId,
         shopping_session_id: sessionId,
         buyer_id: buyerId.trim(),
         query: trimmed,
         ...preferenceHintField(),
       });
       // 用户可能中途切了会话：不要把本轮回复写进别的会话。
-      if (sessionIdRef.current !== requestSessionId) return;
-      if (reply) applyAssistantReply(reply, { query: trimmed });
+      if (!mountedRef.current || activeRef.current !== run || sessionIdRef.current !== requestSessionId) return;
+      run.awaitingResponse = false;
+      run.taskId = submission.task_id ?? "";
+      run.traceId = submission.trace_id ?? run.traceId;
+      const buffered = run.buffer;
+      run.buffer = [];
+      buffered.forEach(entry => dispatchEventRef.current(entry.event, entry.payload));
+      if (activeRef.current !== run) return;
+      if (submission.reply) applyAssistantReply(submission.reply, { query: trimmed, traceId: run.traceId });
+      if (!run.taskId || !["queued", "running"].includes(submission.status ?? "")) {
+        finishRun();
+      } else {
+        async function poll() {
+          if (!mountedRef.current || activeRef.current !== run) return;
+          try {
+            const state = await fetchIntentTask(run.taskId);
+            if (!mountedRef.current || activeRef.current !== run) return;
+            if (state.task_id !== run.taskId) throw new Error("任务标识不匹配 / Task mismatch");
+            if (!state.found || ["failed", "cancelled", "expired"].includes(state.state)) {
+              setLastError({kind: "request", message: state.error || "任务已失效 / Task expired", query: trimmed});
+              finishRun(); return;
+            }
+            if (["done", "completed"].includes(state.state)) {
+              if (state.final_text) applyAssistantReply(state.final_text, {query: trimmed, traceId: run.traceId});
+              setLastError(prev => prev?.kind === "sse" || prev?.kind === "waiting" ? null : prev);
+              finishRun(); return;
+            }
+          } catch (e) {
+            if (!mountedRef.current || activeRef.current !== run) return;
+            setLastError({kind: "sse", message: e instanceof Error ? e.message : String(e)});
+          }
+          if (activeRef.current === run) run.poll = setTimeout(() => void poll(), 1500);
+        }
+        run.poll = setTimeout(() => void poll(), 1500);
+      }
     } catch (error) {
-      if (sessionIdRef.current !== requestSessionId) return;
+      if (!mountedRef.current || activeRef.current !== run || sessionIdRef.current !== requestSessionId) return;
       appendTimeline("error", error instanceof Error ? error.message : String(error));
       updateAssistant("replace", "");
       setLastError({
@@ -512,14 +653,13 @@ export default function App() {
         message: error instanceof Error ? error.message : String(error),
         query: trimmed,
       });
-    } finally {
-      setSending(false);
+      finishRun();
     }
   }
 
   function retryLastError(): void {
     if (!lastError) return;
-    if (lastError.kind === "sse") {
+    if (lastError.kind === "sse" || lastError.kind === "waiting") {
       setLastError(null);
       setSseNonce((prev) => prev + 1);
       return;
@@ -537,15 +677,23 @@ export default function App() {
     if (!action) return;
     if (action.type === "confirm_order" || action.type === "cancel_order") {
       const isConfirm = action.type === "confirm_order";
+      const targetSession = sessionIdRef.current;
       try {
         const response = await confirmOrder(
           action.token,
           isConfirm ? "confirm" : "cancel",
         );
-        if (response.status === "unknown") {
-          setOrderPreview((prev) => (prev ? { ...prev, hintKey: "order.expiredHint" } : prev));
+        if (!mountedRef.current || sessionIdRef.current !== targetSession) return;
+        if (["unknown", "timeout", "expired"].includes(response.status)) {
+          setOrderPreview(prev => prev?.token === action.token && prev.source !== "result" ? {...prev, state: PREVIEW_STATE.EXPIRED, error: "", hintKey: prev.operation === "cancel_order" ? previewHintKey(PREVIEW_STATE.EXPIRED, prev.operation) : "order.expiredHint"} : prev);
+          return;
         }
+        if (!response.ok || !["confirmed", "cancelled"].includes(response.status)) throw new Error("确认未成功，请重试 / Confirmation failed, retry");
+        const state = response.status === "confirmed" ? PREVIEW_STATE.CONFIRMED : PREVIEW_STATE.CANCELLED;
+        setOrderPreview(prev => prev?.token === action.token && prev.source !== "result" ? {...prev, state, error: "", hintKey: previewHintKey(state, prev.operation)} : prev);
       } catch (error) {
+        if (!mountedRef.current || sessionIdRef.current !== targetSession) return;
+        setOrderPreview(prev => prev?.token === action.token && prev.source !== "result" ? {...prev, state: PREVIEW_STATE.PENDING, error: error instanceof Error ? error.message : String(error), hintKey: previewHintKey(PREVIEW_STATE.PENDING, prev.operation)} : prev);
         appendTimeline(
           "order.confirm_error",
           error instanceof Error ? error.message : String(error),
@@ -566,7 +714,7 @@ export default function App() {
   }
 
   function handlePreviewDecision(decision: "confirm" | "cancel") {
-    if (!orderPreview) return;
+    if (!orderPreview || orderPreview.state === PREVIEW_STATE.SUBMITTING) return;
     const decided = applyPreviewAction(
       {
         state: orderPreview.state,
@@ -576,7 +724,7 @@ export default function App() {
       decision,
     );
     setOrderPreview((prev) =>
-      prev ? { ...prev, state: decided.state, hintKey: previewHintKey(decided.state) } : prev,
+      prev ? { ...prev, error: "", state: decided.state, hintKey: previewHintKey(decided.state, prev.operation) } : prev,
     );
     void runPreviewAction(decided.action);
   }
@@ -594,6 +742,7 @@ export default function App() {
   }
 
   useEffect(() => {
+    setEventsConnected(false);
     const source = openEvents(sessionId);
 
     function payloadOf(event: Event): unknown {
@@ -621,6 +770,8 @@ export default function App() {
           query: pendingQueryRef.current,
         });
       }
+      setLastError(prev => prev?.kind === "sse" || prev?.kind === "waiting" ? null : prev);
+      finishRun();
     }
 
     function onToolInvoke(event: Event) {
@@ -642,13 +793,34 @@ export default function App() {
       const record = asRecord(payload);
       const tool = readString(record, "tool");
       if (tool === "create_order" || tool === "query_order" || tool === "cancel_order") {
+        const current = orderPreviewRef.current;
+        if (current && tool !== "query_order" && !resultMatchesPreview(payload, current)) return;
         const parsed = parseOrderToolResult(payload);
+        const decision = parsed?.order ?? record;
+        if (tool === "cancel_order" && (decision?.cancelled === true || decision?.executed === false)) {
+          const expired = decision.reason === "confirmation_timeout";
+          setOrderPreview(prev => prev?.operation === "cancel_order" && prev.source !== "result" ? {
+            ...prev, source: "result", state: expired ? PREVIEW_STATE.EXPIRED : PREVIEW_STATE.CANCELLED,
+            error: readString(decision, "error") ?? "",
+            hintKey: expired ? "order.cancellationExpiredHint" : "order.cancellationRetainedHint",
+          } : prev);
+          return;
+        }
         if (parsed?.order) {
-          applyOrderResult(parsed.order as OrderSnapshot);
+          const failure = readString(parsed.order, "error");
+          if (failure) {
+            if (current && tool !== "query_order") setOrderPreview({...current, source: "result", state: PREVIEW_STATE.FAILED, error: failure,
+              hintKey: tool === "cancel_order" ? "order.cancellationFailedHint" : "order.failedHint"});
+            appendTimeline(`${tool}.error`, failure);
+            return;
+          }
+          applyOrderResult(parsed.order as OrderSnapshot, tool, readString(record, "confirmation_token"));
           return;
         }
         const failure = parsed?.error;
         if (failure) {
+          if (current && tool !== "query_order") setOrderPreview({...current, source: "result", state: PREVIEW_STATE.FAILED, error: failure,
+            hintKey: tool === "cancel_order" ? "order.cancellationFailedHint" : "order.failedHint"});
           appendTimeline(`${tool}.error`, failure);
           return;
         }
@@ -688,21 +860,64 @@ export default function App() {
     }
 
     /** SSE 断线：保留已收到的回答，给出重连按钮（不自动重复提交请求）。 */
-    function onSseError() {
+    function onSseError(event?: Event) {
+      // A data-bearing `event: error` is a task failure, not a broken connection.
+      if ((event as MessageEvent | undefined)?.data) return;
+      setEventsConnected(false);
       setLastError((prev) => (prev && prev.kind === "request" ? prev : { kind: "sse" }));
     }
 
-    source.addEventListener("token.delta", onTokenDelta);
-    source.addEventListener("final.result", onFinalResult);
-    source.addEventListener("tool.invoke", onToolInvoke);
-    source.addEventListener("tool.result", onToolResult);
-    source.addEventListener("order.preview", onOrderPreviewSse);
-    source.addEventListener("agent.dispatch", onAgentDispatch);
-    source.addEventListener("cache.hit", onCacheHit);
-    source.addEventListener("context.compressed", onContextCompressed);
+    const handlers: Record<string, (event: Event) => void> = {
+      "token.delta": onTokenDelta, "final.result": onFinalResult,
+      "tool.invoke": onToolInvoke, "tool.result": onToolResult,
+      "order.preview": onOrderPreviewSse, "agent.dispatch": onAgentDispatch,
+      "cache.hit": onCacheHit, "context.compressed": onContextCompressed,
+      "task.started": () => {},
+      "error": event => {
+        const payload = asRecord(payloadOf(event));
+        setLastError({kind: "request", message: readString(payload, "message") ?? readString(payload, "error") ?? "任务失败 / Task failed", query: activeRef.current?.query});
+        finishRun();
+      },
+      "task.failed": event => handlers.error(event),
+      "task.completed": () => {}, // Poll the durable final_text if final.result was lost.
+    };
+    function dispatch(name: string, payload: unknown) {
+      const run = activeRef.current;
+      if (!mountedRef.current || !run || sessionIdRef.current !== sessionId) return;
+      const record = asRecord(payload);
+      const requestId = readString(record, "client_request_id") ?? "";
+      const taskId = readString(record, "task_id") ?? "";
+      const traceId = readString(record, "trace_id") ?? "";
+      if (requestId && requestId !== run.requestId) return;
+      if (traceId && retiredTracesRef.current.has(traceId)) return;
+      if (!requestId && run.awaitingResponse) {
+        run.buffer = [...run.buffer.slice(-199), {event: name, payload}];
+        return;
+      }
+      if (!requestId && !(run.taskId && (taskId === run.taskId || traceId === run.taskId)) && !(run.traceId && traceId === run.traceId)) return;
+      if (run.taskId && taskId && run.taskId !== taskId) return;
+      if (run.traceId && traceId && run.traceId !== traceId) return;
+      if (traceId) run.traceId = traceId;
+      handlers[name]?.(new MessageEvent(name, {data: JSON.stringify(payload)}));
+    }
+    dispatchEventRef.current = dispatch;
+    const listeners = Object.keys(handlers).map(name => {
+      const listener = (event: Event) => {
+        // EventSource also uses "error" for transport errors, with no data.
+        if (name === "error" && !(event as MessageEvent).data) return;
+        dispatch(name, payloadOf(event));
+      };
+      source.addEventListener(name, listener);
+      return {name, listener};
+    });
+    source.onopen = () => {
+      setEventsConnected(true);
+      setLastError(prev => prev?.kind === "sse" ? null : prev);
+    };
     source.onerror = onSseError;
 
     return () => {
+      listeners.forEach(({name, listener}) => source.removeEventListener(name, listener));
       source.removeEventListener("token.delta", onTokenDelta);
       source.removeEventListener("final.result", onFinalResult);
       source.removeEventListener("tool.invoke", onToolInvoke);
@@ -724,7 +939,7 @@ export default function App() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = query.trim();
-    if (!text || sending) return;
+    if (!text || sending || !eventsConnected) return;
     setQuery("");
     setOrderPreview(null);
     setOrderLookupError("");
@@ -752,7 +967,7 @@ export default function App() {
     }
   }
 
-  const canSend = !sending && buyerId.trim().length > 0 && query.trim().length > 0;
+  const canSend = eventsConnected && !sending && buyerId.trim().length > 0 && query.trim().length > 0;
   const hasProductHits =
     comparison.length > 0 || timeline.some((entry) => (entry.hits?.length ?? 0) > 0);
   const searchSkeletonVisible = sending && !hasProductHits;
@@ -783,12 +998,15 @@ export default function App() {
       </header>
 
       <section style={styles.sessionBar}>
+        {auth.buyer_id && <button onClick={onLogout} type="button">退出登录 / Sign out</button>}
         <label style={styles.field}>
           <span>{t(lang, "session.buyerId")}</span>
           <input
             style={styles.input}
-            value={buyerId}
-            onChange={(event) => setBuyerId(event.target.value)}
+            value={buyerDraft}
+            readOnly={Boolean(auth.buyer_id)}
+            onChange={(event) => setBuyerDraft(event.target.value)}
+            onBlur={() => { if (!auth.buyer_id) onBuyerChange(buyerDraft.trim()); }}
           />
         </label>
         <label style={styles.field}>
@@ -829,6 +1047,7 @@ export default function App() {
             sessions={sessions}
             sessionId={sessionId}
             syncing={syncing}
+            busy={sending}
             syncError={syncError}
             onSwitch={switchSession}
             onNew={startNewSession}
@@ -839,7 +1058,7 @@ export default function App() {
           {lastError && lastError.kind !== "subagent" && (
             <div style={styles.errorBanner} data-testid="error-banner" role="alert">
               <span>
-                {lastError.kind === "sse"
+                {lastError.kind === "waiting" ? lastError.message : lastError.kind === "sse"
                   ? t(lang, "error.sse")
                   : `${t(lang, "error.request")}${lastError.message ? `：${lastError.message}` : ""}`}
               </span>
@@ -849,7 +1068,7 @@ export default function App() {
                 data-testid="retry-button"
                 onClick={retryLastError}
               >
-                {lastError.kind === "sse" ? t(lang, "error.retrySse") : t(lang, "error.retry")}
+                {lastError.kind === "waiting" ? "继续等待 / Keep waiting" : lastError.kind === "sse" ? t(lang, "error.retrySse") : t(lang, "error.retry")}
               </button>
             </div>
           )}

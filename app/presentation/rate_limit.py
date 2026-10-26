@@ -153,6 +153,10 @@ async def resolve_identity(request: Request, scope: str) -> str:
     if scope == "ip":
         return client_ip(request)
 
+    user = getattr(request.state, "principal", None)
+    if user is not None:
+        return user.buyer_id
+
     # buyer 维度：显式 buyer_id > 会话 id > 客户端 IP。
     buyer_id = request.query_params.get("buyer_id")
     if not buyer_id:

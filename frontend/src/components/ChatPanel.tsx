@@ -65,6 +65,12 @@ export function ChatPanel({
   onLookupOrder: (orderId: string) => void;
   extractEvidence: (order: unknown) => ChatOrderEvidence;
 }) {
+  const cancelling = orderPreview?.operation === "cancel_order";
+  const cancellationBadge = !orderPreview ? "" : orderPreview.state === PREVIEW_STATE.CANCELLED
+    ? orderPreview.hintKey === "order.cancellationCompleteHint" ? "order.cancellationCompleteBadge" : "order.cancellationRetainedBadge"
+    : orderPreview.state === PREVIEW_STATE.FAILED ? "order.cancellationFailedBadge"
+    : orderPreview.state === PREVIEW_STATE.EXPIRED ? "order.cancellationExpiredBadge"
+    : orderPreview.state === PREVIEW_STATE.CONFIRMED ? "order.cancellationWaitingBadge" : "order.cancellationPendingBadge";
   return (
     <section style={styles.panel}>
       <h2 style={styles.panelTitle}>{t(lang, "chat.title")}</h2>
@@ -150,10 +156,13 @@ export function ChatPanel({
 
       {orderPreview &&
         (orderPreview.state === PREVIEW_STATE.PENDING ||
-          orderPreview.state === PREVIEW_STATE.CONFIRMED) && (
+          orderPreview.state === PREVIEW_STATE.SUBMITTING ||
+          orderPreview.state === PREVIEW_STATE.EXPIRED ||
+          orderPreview.state === PREVIEW_STATE.FAILED ||
+          orderPreview.state === PREVIEW_STATE.CONFIRMED || cancelling) && (
           <section style={styles.preview} data-testid="order-preview">
             <div style={styles.previewHead}>
-              <strong>{t(lang, "order.previewTitle")}</strong>
+              <strong>{t(lang, cancelling ? "order.cancellationTitle" : "order.previewTitle")}</strong>
             </div>
             <OrderCardView
               lang={lang}
@@ -163,30 +172,35 @@ export function ChatPanel({
                 status: orderPreview.card.status,
               })}
               badgeOverride={
-                orderPreview.state === PREVIEW_STATE.CONFIRMED
+                cancelling ? {tone: orderPreview.state === PREVIEW_STATE.CANCELLED ? "green" : "amber", text: t(lang, cancellationBadge)} : orderPreview.state === PREVIEW_STATE.FAILED
+                  ? {tone: "amber", text: t(lang, "order.failedBadge")} : orderPreview.state === PREVIEW_STATE.CONFIRMED
                   ? { tone: "green", text: t(lang, "order.confirmingBadge") }
                   : { tone: "amber", text: t(lang, "order.pendingBadge") }
               }
               onQuery={onLookupOrder}
             />
             <div style={styles.badgeHint}>{t(lang, orderPreview.hintKey)}</div>
-            {orderPreview.state === PREVIEW_STATE.PENDING && (
+            {orderPreview.state === PREVIEW_STATE.SUBMITTING && <div role="status">正在提交 / Submitting…</div>}
+            {orderPreview.error && <div role="alert">{orderPreview.error}</div>}
+            {(orderPreview.state === PREVIEW_STATE.PENDING || orderPreview.state === PREVIEW_STATE.SUBMITTING) && (
               <div style={styles.orderActions}>
                 <button
                   type="button"
                   style={styles.primaryButton}
                   data-testid="order-confirm"
+                  disabled={orderPreview.state === PREVIEW_STATE.SUBMITTING}
                   onClick={() => onPreviewDecision("confirm")}
                 >
-                  {t(lang, "order.confirm")}
+                  {t(lang, cancelling ? "order.cancellationConfirm" : "order.confirm")}
                 </button>
                 <button
                   type="button"
                   style={styles.ghostButton}
                   data-testid="order-cancel"
+                  disabled={orderPreview.state === PREVIEW_STATE.SUBMITTING}
                   onClick={() => onPreviewDecision("cancel")}
                 >
-                  {t(lang, "order.cancel")}
+                  {t(lang, cancelling ? "order.cancellationKeep" : "order.cancel")}
                 </button>
               </div>
             )}

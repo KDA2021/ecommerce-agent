@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -105,9 +106,13 @@ async def test_search_parallel_fans_two_subagent_results_back_into_main_agent():
     seen_instructions = []
     for call in search_llm.calls:
         human_contents = [str(m.content) for m in call if isinstance(m, HumanMessage)]
-        assert len(human_contents) == 1
-        assert "PARENT_HISTORY_MARKER" not in human_contents[0]
-        seen_instructions.append(human_contents[0])
+        # Historical context now travels as a lower-authority JSON data message;
+        # the final human message remains this branch's actual task instruction.
+        assert len(human_contents) == 2
+        background = json.loads(human_contents[0])
+        assert background["trust"] == "untrusted_history"
+        assert "PARENT_HISTORY_MARKER" not in human_contents[-1]
+        seen_instructions.append(human_contents[-1])
     assert sorted(seen_instructions) == sorted(task.instruction for task in tasks)
 
     assert len(main_llm.calls) == 1
@@ -142,9 +147,12 @@ async def test_prepare_isolates_parent_history_and_keeps_summary():
     assert all("父历史不应出现" not in str(m.content) for m in prompted_messages)
     assert all("无 id 的父历史也不应出现" not in str(m.content) for m in prompted_messages)
     human_contents = [str(m.content) for m in prompted_messages if isinstance(m, HumanMessage)]
-    assert human_contents == ["只查找无塑料旅行三件套"]
+    assert human_contents[-1] == "只查找无塑料旅行三件套"
+    background = json.loads(human_contents[0])
+    assert background["trust"] == "untrusted_history"
+    assert background["content"] == "买家偏好无塑料"
     system_contents = [str(m.content) for m in prompted_messages if isinstance(m, SystemMessage)]
-    assert any("买家偏好无塑料" in content for content in system_contents)
+    assert all("买家偏好无塑料" not in content for content in system_contents)
 
     final_contents = [str(m.content) for m in result["messages"]]
     assert "父历史不应出现" not in final_contents

@@ -39,6 +39,7 @@ def make_compress_node(compression_llm, settings, broker=None, throttle=None, tr
                 result = await compress_messages(
                     compression_llm, state["messages"],
                     settings.context_trigger_tokens, settings.context_keep_recent,
+                    prior_summary=state.get("summary", ""),
                 )
             if span is not None and getattr(span, "attrs", None) is not None:
                 span.attrs["compressed"] = bool(result.get("summary"))

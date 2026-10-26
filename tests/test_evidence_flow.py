@@ -169,7 +169,7 @@ async def test_create_order_tool_replays_and_records_verified_evidence():
         cancel,
         task_store=task_store,
         task_id_prefix="order",
-    )
+     require_confirmation=False)
     create = next(tool for tool in tools if tool.name == "create_order")
 
     token = ShoppingContext.set(

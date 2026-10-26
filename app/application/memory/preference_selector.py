@@ -16,11 +16,13 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 from typing import Optional, Sequence
 
 from app.domain.buyer.preference import BuyerPreference
+from app.domain.buyer.preference_facts import safe_preference
 from app.domain.catalog.ports.retrieval_ports import EmbeddingClient
 
 logger = logging.getLogger(__name__)
@@ -47,35 +49,39 @@ def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
 
 
 def render_preference_lines(preferences: Sequence[BuyerPreference]) -> str:
-    """渲染偏好正文行。主 Agent 与子 Agent 共用同一个实现，避免两处格式漂。
+    """Render bounded canonical business JSON, excluding quarantined legacy text.
 
-    Args:
-        preferences: 偏好序列。
-
-    Returns:
-        多行 ``- [kind] statement`` 文本。
+    The envelope/message authority is owned by the caller. This function never
+    serializes raw statements, identities, provenance, or arbitrary extra fields.
     """
-    return "\n".join(f"- [{p.kind}] {p.statement}" for p in preferences)
+    rows = []
+    seen = set()
+    for raw in preferences:
+        preference = safe_preference(raw)
+        if preference is None:
+            continue
+        key = (preference.kind, preference.attribute, preference.value, preference.currency)
+        if key in seen:
+            continue
+        seen.add(key)
+        row = {
+            "kind": preference.kind, "attribute": preference.attribute,
+            "value": preference.value, "statement": preference.statement,
+        }
+        if preference.currency:
+            row["currency"] = preference.currency
+        rows.append(row)
+        if len(rows) >= 128:
+            break
+    return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
 def render_preference_hint(preferences: Sequence[BuyerPreference]) -> str:
-    """渲染完整的 <buyer-preferences> 注入块。
-
-    不写进 system prompt 而作为一条 hint 消息注入：system prompt 是 Prompt Cache
-    的稳定前缀，把因人而异的偏好拼进去等于每个买家的前缀都不一样，命中率直接崩。
-
-    Args:
-        preferences: 偏好序列。
-
-    Returns:
-        完整的 ``<buyer-preferences>`` 注入块。
-    """
-    return (
-        "<buyer-preferences>\n以下是该买家的长期偏好（来自历史会话，供个性化推荐参考，"
-        "like=喜好，dislike=忌口/黑名单）：\n"
-        + render_preference_lines(preferences)
-        + "\n</buyer-preferences>"
-    )
+    """Return an empty hint for quarantined-only memory, otherwise business data."""
+    payload = render_preference_lines(preferences)
+    if payload == "[]":
+        return ""
+    return "<buyer-preferences>\n" + payload + "\n</buyer-preferences>"
 
 
 class PreferenceSelector:
@@ -116,8 +122,9 @@ class PreferenceSelector:
         if not preferences:
             return []
 
-        dislikes = [p for p in preferences if p.kind == "dislike"]
-        likes = [p for p in preferences if p.kind != "dislike"]
+        safe = [safe_preference(p) for p in preferences]
+        dislikes = [p for p in safe if p is not None and p.kind == "dislike"]
+        likes = [p for p in safe if p is not None and p.kind == "like"]
 
         if top_k <= 0:
             # 只保留安全底线，正向偏好全部让位

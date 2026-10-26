@@ -87,7 +87,9 @@ def test_frontend_helper_source_keeps_contract_fields():
     assert "/api/commerce/orders/confirm" in api_source
     assert "confirmOrder" in api_source
     app_source = (FRONTEND / "src" / "App.tsx").read_text(encoding="utf-8")
-    assert 'addEventListener("order.preview"' in app_source
+    # Subscription is now registered through a correlated event-handler map;
+    # frontend runtime tests verify actual preview delivery and retry behavior.
+    assert '"order.preview": onOrderPreviewSse' in app_source
     assert "confirmOrder(" in app_source
 
 
@@ -166,7 +168,7 @@ def test_order_tool_names_unchanged():
         PlaceOrderUseCase(product_repo, order_repo),
         QueryOrderUseCase(order_repo),
         CancelOrderUseCase(product_repo, order_repo),
-    )
+     require_confirmation=False)
     assert [tool.name for tool in tools] == ["create_order", "query_order", "cancel_order"]
     assert asyncio.iscoroutinefunction(tools[0].coroutine)
 
@@ -211,7 +213,7 @@ def _order_tools():
     place = PlaceOrderUseCase(product_repo, order_repo)
     query = QueryOrderUseCase(order_repo)
     cancel = CancelOrderUseCase(product_repo, order_repo)
-    return build_order_tools(place, query, cancel), order_repo
+    return build_order_tools(place, query, cancel, require_confirmation=False), order_repo
 
 
 _SHIPPING_ADDRESS = {
@@ -248,7 +250,7 @@ async def test_create_order_result_keeps_frontend_contract_fields():
         QueryOrderUseCase(order_repo),
         CancelOrderUseCase(product_repo, order_repo),
         task_store=InMemoryTaskStateStore(),
-    )
+     require_confirmation=False)
     create = next(tool for tool in tools if tool.name == "create_order")
 
     token = ShoppingContext.set(
@@ -311,7 +313,7 @@ async def test_tool_invoke_event_payload_matches_frontend_parser():
         CancelOrderUseCase(product_repo, order_repo),
         broker=broker,
         task_store=InMemoryTaskStateStore(),
-    )
+     require_confirmation=False)
     create = next(tool for tool in tools if tool.name == "create_order")
 
     token = ShoppingContext.set(
@@ -602,6 +604,7 @@ async def test_order_preview_event_carries_token_and_price_free_preview():
     assert [kind for _, kind, _ in broker.events] == [
         "tool.invoke",
         "order.preview",
+        "security.authorized",
         "tool.result",
     ]
 
@@ -632,7 +635,7 @@ async def test_create_order_cancel_never_calls_place():
             task.cancel()
         ShoppingContext.reset(token)
 
-    assert result == {"cancelled": True, "reason": "user_cancelled", "order": None}
+    assert result == {"cancelled": True, "reason": "user_cancelled", "order": None, "executed": False}
     assert len(order_repo._orders) == 0
     result_payloads = broker.by_type("tool.result")
     assert result_payloads[-1]["tool"] == "create_order"
@@ -660,7 +663,7 @@ async def test_create_order_timeout_never_calls_place():
     finally:
         ShoppingContext.reset(token)
 
-    assert result == {"cancelled": True, "reason": "confirmation_timeout", "order": None}
+    assert result == {"cancelled": True, "reason": "confirmation_timeout", "order": None, "executed": False}
     assert len(order_repo._orders) == 0
     assert [kind for _, kind, _ in broker.events] == [
         "tool.invoke",
@@ -739,7 +742,7 @@ async def test_create_order_without_manager_keeps_direct_execution():
     tools = build_order_tools(
         *_use_cases(),
         broker=broker,
-    )
+     require_confirmation=False)
     create = next(tool for tool in tools if tool.name == "create_order")
 
     token = ShoppingContext.set(

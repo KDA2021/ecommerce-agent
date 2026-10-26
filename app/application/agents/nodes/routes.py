@@ -17,6 +17,7 @@ from app.application.agents.subagents.base import (
     PlannerDecision,
     subtask_task_id,
 )
+from app.application.agents.task_context import task_context
 from app.application.evidence.task_state import TaskRecord, TaskStatus
 from app.infrastructure.context import ShoppingContext
 
@@ -219,6 +220,7 @@ async def route_after_planner(state: MainState, broker=None, task_store=None):
                     "task_id": task_id,
                     "generation": 1,
                     "chain_index": 0,
+                    "summary": task_context(state),
                 },
             )
         ]
@@ -237,6 +239,7 @@ async def route_after_planner(state: MainState, broker=None, task_store=None):
                 {
                     "subtask": subtask,
                     "preference_hint": state.get("preference_hint", ""),
+                    "summary": task_context(state),
                     "task_id": task_id,
                     "generation": 1,
                 },
@@ -318,6 +321,7 @@ async def route_next_trade(
                 "task_id": next_task_id,
                 "generation": 1,
                 "chain_index": next_index,
+                "summary": task_context(state),
             },
         )
     ]

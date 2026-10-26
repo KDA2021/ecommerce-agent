@@ -8,6 +8,7 @@
  * 设计约束（Task 2 修复后）：真实门控由后端 `OrderConfirmationManager` 承担，
  * 前端只消费两类事件：
  *   - order.preview: {"tool": "create_order", "token": ..., "preview": {items, shipping_address}}
+ *                    {"tool": "cancel_order", "token": ..., "preview": {order_id, reason, order}}
  *     ← 收到它时后端已挂起等待；前端展示确认卡并 POST /commerce/orders/confirm。
  *   - tool.result:   {"tool": "create_order", "order": {..., status, verification_status}}
  *     ← 确认 / 取消后后端返回结果，前端展示结果卡与证据徽章。
@@ -18,6 +19,9 @@
 export const PREVIEW_STATE = {
   IDLE: "idle",
   PENDING: "pending",
+  SUBMITTING: "submitting",
+  EXPIRED: "expired",
+  FAILED: "failed",
   CONFIRMED: "confirmed",
   CANCELLED: "cancelled",
 } as const;
@@ -124,12 +128,12 @@ export interface OrderCard {
   created_at?: string;
 }
 
-/** order.preview 事件的确认载荷：token + 预览（不含单价）。 */
-export interface OrderPreviewPayload {
-  token: string;
-  preview: CreateOrderArgs;
-  trace_id: string;
-}
+/** order.preview 确认载荷：下单入参或取消目标的可信订单快照。 */
+export type OrderOperation = "create_order" | "cancel_order";
+export type OrderPreviewPayload = { token: string; trace_id: string } & (
+  | { tool: "create_order"; preview: CreateOrderArgs }
+  | { tool: "cancel_order"; preview: { order_id: string; reason: string; order: Record<string, unknown> } }
+);
 
 /** preview 状态机当前态。 */
 export interface PreviewSnapshot {
@@ -217,7 +221,7 @@ export function parseCreateOrderInvocation(event: unknown): CreateOrderArgs | nu
 }
 
 /**
- * 解析 order.preview 事件：返回 {token, preview, trace_id}，不匹配 / 残缺返回 null。
+ * 解析 order.preview 事件：返回 {tool, token, preview, trace_id}，残缺返回 null。
  *
  * 这是 Task 2 修复后的主路径：收到该事件时后端 create_order 已真实挂起等待，
  * 前端必须把 token 原样回传 POST /commerce/orders/confirm 才能放行 / 取消。
@@ -227,19 +231,27 @@ export function parseCreateOrderInvocation(event: unknown): CreateOrderArgs | nu
  */
 export function parseOrderPreview(event: unknown): OrderPreviewPayload | null {
   if (!isRecord(event)) return null;
-  if (readString(event, "tool") !== "create_order") return null;
+  const tool = readString(event, "tool");
+  if (tool !== "create_order" && tool !== "cancel_order") return null;
   const token = readString(event, "token");
   if (!token) return null;
   const preview = isRecord(event.preview) ? event.preview : null;
   if (!preview) return null;
+  const trace_id = readString(event, "trace_id") ?? "";
+  if (tool === "cancel_order") {
+    const order_id = readString(preview, "order_id");
+    const order = isRecord(preview.order) ? preview.order : null;
+    if (!order_id || !order || readString(order, "order_id") !== order_id || !readString(order, "status")) return null;
+    return {tool, token, trace_id, preview: {order_id, reason: readString(preview, "reason") ?? "", order: {...order}}};
+  }
   // 复用 tool.invoke 的入参校验：把 preview 包成它认识的 event 形状。
   const args = parseCreateOrderInvocation({ tool: "create_order", args: preview });
   if (!args) return null;
-  return { token, preview: args, trace_id: readString(event, "trace_id") ?? "" };
+  return { tool, token, preview: args, trace_id };
 }
 
 /**
- * 把 order.preview 载荷组装成预览卡片数据（source=preview，order_id 尚未生成）。
+ * 把 order.preview 组装成卡片：下单订单号待生成，取消保留已有订单号与金额。
  *
  * @param envelope order.preview 事件载荷。
  * @returns 预览卡片数据；无法解析返回 null。
@@ -247,6 +259,10 @@ export function parseOrderPreview(event: unknown): OrderPreviewPayload | null {
 export function buildPreviewFromOrderPreview(envelope: unknown): OrderCard | null {
   const parsed = parseOrderPreview(envelope);
   if (!parsed) return null;
+  if (parsed.tool === "cancel_order") {
+    const card = buildResultCard(parsed.preview.order);
+    return card ? {...card, source: "preview", cancel_reason: parsed.preview.reason} : null;
+  }
   const card = buildPreviewFromInvocation(parsed.preview);
   if (!card) return null;
   return { ...card, source: "preview", order_id: "" };
@@ -473,7 +489,7 @@ export function applyPreviewAction(
         : null,
     };
   }
-  if (state === PREVIEW_STATE.CANCELLED) {
+  if (state === PREVIEW_STATE.CANCELLED || state === PREVIEW_STATE.SUBMITTING || state === PREVIEW_STATE.EXPIRED || state === PREVIEW_STATE.FAILED) {
     return { state, action: null };
   }
 
@@ -482,7 +498,7 @@ export function applyPreviewAction(
     if (token) {
       // 真实握手：POST /commerce/orders/confirm 唤醒后端 create_order 继续下单。
       return {
-        state: PREVIEW_STATE.CONFIRMED,
+        state: PREVIEW_STATE.SUBMITTING,
         action: { type: "confirm_order", token, endpoint: "/api/commerce/orders/confirm" },
       };
     }
@@ -504,7 +520,7 @@ export function applyPreviewAction(
     if (token) {
       // 真实取消：resolve token=cancel，后端返回 cancelled 且不会下单。
       return {
-        state: PREVIEW_STATE.CANCELLED,
+        state: PREVIEW_STATE.SUBMITTING,
         action: { type: "cancel_order", token, endpoint: "/api/commerce/orders/confirm" },
       };
     }
@@ -524,6 +540,21 @@ export function eventTraceId(event: unknown): string {
   return readString(event, "trace_id") ?? "";
 }
 
+/** Match the server capability first; old cancellation events also need a target order. */
+export function resultMatchesPreview(
+  event: unknown,
+  preview: {operation: OrderOperation; token: string; order_id: string},
+): boolean {
+  if (!isRecord(event) || readString(event, "tool") !== preview.operation) return false;
+  const token = readString(event, "confirmation_token");
+  if (token && token !== preview.token) return false;
+  const orderId = readString(event.order, "order_id") ?? readString(event, "order_id");
+  if (preview.order_id && orderId && orderId !== preview.order_id) return false;
+  if (token) return true;
+  if (preview.operation === "cancel_order") return Boolean(orderId && orderId === preview.order_id);
+  return true;
+}
+
 /**
  * 按 trace_id 在所有事件里找同一轮的订单结果（create_order 优先）。
  *
@@ -534,14 +565,27 @@ export function eventTraceId(event: unknown): string {
 export function findResultForTrace(
   events: Array<{ event: string; payload: unknown }>,
   traceId: string,
+  operation?: OrderOperation,
+  target?: {token: string; order_id: string},
 ): Record<string, unknown> | null {
   if (!Array.isArray(events) || !traceId) return null;
   let fallback: Record<string, unknown> | null = null;
+  let precedingPreviewToken = "";
   for (const entry of events) {
     if (!isRecord(entry)) continue;
+    if (entry.event === "order.preview" && operation && eventTraceId(entry.payload) === traceId) {
+      const preview = parseOrderPreview(entry.payload);
+      if (preview?.tool === operation) precedingPreviewToken = preview.token;
+    }
     if (readString(entry, "event") !== "tool.result") continue;
     const payload = entry.payload;
     if (eventTraceId(payload) !== traceId) continue;
+    if (operation && readString(payload, "tool") !== operation) continue;
+    if (target && operation) {
+      if (!resultMatchesPreview(payload, {...target, operation})) continue;
+      // A legacy result following an earlier preview cannot settle a new token.
+      if (!readString(payload, "confirmation_token") && precedingPreviewToken && precedingPreviewToken !== target.token) continue;
+    }
     const parsed = parseOrderToolResult(payload);
     if (!parsed?.order) continue;
     if (readString(payload, "tool") === "create_order") return parsed.order;
