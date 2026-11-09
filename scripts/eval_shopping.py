@@ -67,6 +67,16 @@ def summarize_runs(runs: list[dict]) -> dict:
             "error_count": sum(bool(row.get("error")) for row in rows),
             "categories": categories,
             "agent_error_count": sum(bool(row.get("error")) for row in rows),
+            "judge_cache_hits": sum(
+                turn.get("judge_cache", {}).get("hits", 0)
+                for row in rows
+                for turn in row.get("turns", [])
+            ),
+            "judge_cache_misses": sum(
+                turn.get("judge_cache", {}).get("misses", 0)
+                for row in rows
+                for turn in row.get("turns", [])
+            ),
             "judge_error_count": sum(
                 any(
                     str(f).startswith("judge_error:")
@@ -269,9 +279,16 @@ def observed_catalog(catalog: dict, events: list) -> dict:
         payload = event[1]
         if event[0] != "tool.result" or payload.get("tool") != "product_search":
             continue
-        for hit in payload.get("hits", []):
+        for hit in [*payload.get("hits", []), *payload.get("filtered_out", [])]:
             quote = hit.get("landed_price") or {}
             product_id = hit.get("product_id")
+            reference = (hit.get("pricing") or {}).get("converted_reference")
+            if product_id in result and isinstance(reference, dict):
+                # Preserve provenance; the grader independently validates rate,
+                # original catalog amount, currency, and the reply's price label.
+                result[product_id].setdefault("observed_prices", []).append(
+                    json.loads(_json(reference))
+                )
             if product_id in result and "landed_total_major" in quote:
                 result[product_id].setdefault("observed_prices", []).append(
                     {
@@ -342,6 +359,7 @@ async def run_trajectory(
         extraction = None
         raw_attempts = []
         judge_counter = _counter()
+        cache_before = judge.stats() if hasattr(judge, "stats") else {}
         if reply and not error:
             prompt = judge_prompt(
                 {
@@ -352,6 +370,7 @@ async def run_trajectory(
                 },
                 reply,
                 evidence_catalog,
+                catalog_mode=getattr(judge, "catalog_mode", "full"),
             )
             # Repair malformed JSON at most once; never retry a valid failing grade.
             for attempt in range(2):
@@ -403,6 +422,10 @@ async def run_trajectory(
                 "latency_seconds": elapsed,
                 "model_usage": usage,
                 "judge_usage": judge_counter.snapshot(),
+                "judge_cache": {
+                    key: value - cache_before.get(key, 0)
+                    for key, value in (judge.stats() if hasattr(judge, "stats") else {}).items()
+                },
                 "expectation": turn["expectation"],
                 "extraction": extraction,
                 "grading": grading,
@@ -424,7 +447,6 @@ async def run_trajectory(
 
 
 async def run(args) -> int:
-    import yaml
     from sqlalchemy import text
     from sqlalchemy.engine import make_url
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -435,16 +457,24 @@ async def run(args) -> int:
     from app.infrastructure.persistence.seed_products import build_seed_products
     from app.infrastructure.settings import load_settings
     from scripts.eval_regression import source_fingerprint
+    from scripts.shopping_suite import load_suite
 
-    tasks = yaml.safe_load(args.tasks.read_text(encoding="utf-8"))["cases"]
+    catalog = catalog_snapshot(build_seed_products())
+    tasks = load_suite(args.tasks, catalog, split=args.split)
     if args.case_ids:
+        if len(args.case_ids) != len(set(args.case_ids)):
+            raise ValueError("Repeated task IDs")
         tasks = [task for task in tasks if task["id"] in args.case_ids]
         if {task["id"] for task in tasks} != set(args.case_ids):
             raise ValueError("Unknown or repeated task IDs")
     schedule = build_schedule([task["id"] for task in tasks], args.repeats)
-    catalog = catalog_snapshot(build_seed_products())
     settings = load_settings()
     effective_config = effective_configuration(settings)
+    effective_config.update(
+        judge_catalog_mode=args.judge_catalog,
+        judge_cache_enabled=not args.no_judge_cache,
+        task_split=args.split,
+    )
     knowledge = {
         str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted((ROOT / "knowledge").rglob("*.md"))
@@ -538,12 +568,19 @@ async def run(args) -> int:
             events_by_route[route] = captured
 
             def capture(session, kind, payload, original=container.broker.publish, sink=captured):
-                if kind.startswith("tool."):
+                if kind.startswith("tool.") or kind == "circuit.open":
                     sink.append((kind, payload))
                 original(session, kind, payload)
 
             container.broker.publish = capture
-        judge = build_chat_model(settings)
+        from scripts.judge_efficiency import CachedJudge
+
+        judge = CachedJudge(
+            build_chat_model(settings),
+            None if args.no_judge_cache else args.judge_cache,
+            effective_config,
+        )
+        judge.catalog_mode = args.judge_catalog
         completed = {(row["task_id"], row["repetition"], row["route"]) for row in runs}
         by_id = {task["id"]: task for task in tasks}
         for row in schedule:
@@ -602,7 +639,65 @@ def main(argv=None) -> int:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--case-ids", nargs="+")
+    parser.add_argument(
+        "--plan-only", type=Path, help="Write an offline execution-size plan; no API/DB calls"
+    )
+    parser.add_argument(
+        "--split", choices=("all", "regression", "development", "acceptance"), default="all"
+    )
+    parser.add_argument(
+        "--judge-catalog",
+        choices=("full", "compact"),
+        default="full",
+        help="Compact is experimental; full remains the reference",
+    )
+    parser.add_argument("--judge-cache", type=Path, default=ROOT / "data/judge-cache")
+    parser.add_argument(
+        "--no-judge-cache",
+        action="store_true",
+        help="Run independent semantic judgments instead of reusing exact requests",
+    )
     args = parser.parse_args(argv)
+    if args.plan_only:
+        if args.run_live:
+            parser.error("Choose plan-only or run-live")
+        from app.infrastructure.persistence.seed_products import build_seed_products
+        from scripts.shopping_suite import load_suite
+
+        catalog = catalog_snapshot(build_seed_products())
+        tasks = load_suite(args.tasks, catalog, split=args.split)
+        if args.case_ids:
+            if len(args.case_ids) != len(set(args.case_ids)):
+                parser.error("Repeated task IDs")
+            tasks = [t for t in tasks if t["id"] in args.case_ids]
+            if {t["id"] for t in tasks} != set(args.case_ids):
+                parser.error("Unknown task IDs")
+        schedule = build_schedule([t["id"] for t in tasks], args.repeats)
+        turns = sum(len(t["turns"]) for t in tasks) * args.repeats * 2
+        plan = {
+            "tasks": len(tasks),
+            "task_ids": [t["id"] for t in tasks],
+            "split": args.split,
+            "repeats": args.repeats,
+            "trajectories": len(schedule),
+            "agent_turns": turns,
+            "judge_calls_without_repairs": turns,
+            "judge_calls_with_repairs_upper_bound": 2 * turns,
+            "model_calls_made": 0,
+            "database_calls_made": 0,
+            "catalog_sha256": _hash(catalog),
+            "tasks_sha256": _hash(tasks),
+            "judge_catalog": args.judge_catalog,
+            "agent_model_calls_upper_bound": None,
+            "estimated_tokens": None,
+            "estimated_money": None,
+            "scope": "Planned turns and judge attempts, not a token or monetary spending limit.",
+        }
+        args.plan_only.parent.mkdir(parents=True, exist_ok=True)
+        with args.plan_only.open("x", encoding="utf-8") as output:
+            json.dump(plan, output, ensure_ascii=False, indent=2)
+        print(f"Offline execution plan: {args.plan_only.resolve()}")
+        return 0
     if not args.run_live:
         parser.error("Use --run-live to authorize real model evaluation")
     return asyncio.run(run(args))

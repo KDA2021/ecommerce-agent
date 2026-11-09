@@ -179,7 +179,7 @@ async def test_budget_reason_uses_landed_price_when_shipping_known():
     """命中 ship_to 时预算判定用到手价，而不是裸价。
 
     P-RECO-1 裸价 129：给上限 150 时裸价算命中；但发 CN 的到手价 154 > 150，
-    所以真实结论必须是"不命中"——用到手价才不会把含运税的超支说成预算命中。
+    所以必须硬过滤，不得进入推荐列表。
     """
     usecase = _usecase()
 
@@ -193,9 +193,10 @@ async def test_budget_reason_uses_landed_price_when_shipping_known():
             normalized_query=QUERY, price_max_major=150.0, ship_to="CN", top_k=5,
         ),
     )
-    hit = _hit(with_shipping, "P-RECO-1")
-    assert hit["landed_price"]["landed_total_major"] == 154.0
-    assert REASON_BUDGET_MATCH not in _codes(hit)
+    assert all(hit["product_id"] != "P-RECO-1" for hit in with_shipping["hits"])
+    rejected = next(item for item in with_shipping["filtered_out"] if item["product_id"] == "P-RECO-1")
+    assert rejected["reason"] == "over_price_cap"
+    assert rejected["landed_price"]["landed_total_major"] == 154.0
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "annotations": [
+    {
+      "suite": "shopping_tasks_v2.yaml",
+      "task_id": "shopping-v2-card-reader",
+      "status": "ambiguous_attribute_oracle",
+      "unverified_requirement": "双口接口数量",
+      "evidence": "P1030描述包含SD TF、USB3.2、带卡仓，但未明确接口数量。SD/TF卡型不能等同于双口接口。",
+      "use_for": "候选覆盖诊断与诚实表达不确定性",
+      "exclude_from": "严格双口需求完成率或修复前后成功率声明",
+      "replacement_development_case": "repair-sdvault-catalog-exact",
+      "human_confirmed": false
+    }
+  ],
+  "policy": "Preserve the frozen original suite and its raw results. These annotations do not change historical verdicts or constitute human labels."
+}

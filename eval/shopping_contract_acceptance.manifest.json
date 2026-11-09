@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "suite_sha256": "b1bfbf6c1f5571119d03ad00e54cdd43e86f663a487f37a258e018e652760a11",
+  "catalog_sha256": "5242e4808a62e0aef2a3423d7efa25706c48d4f5dda466ea7a4ecbeeeea6741d",
+  "authored_cases": 6,
+  "status": "authored_unrun_not_human_accepted"
+}

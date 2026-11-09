@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "suite_sha256": "fd0be6f345c905a9b7d292ed35ddf319a10111ea9f7eb6d9543e851eb62ea92c",
+  "catalog_sha256": "5242e4808a62e0aef2a3423d7efa25706c48d4f5dda466ea7a4ecbeeeea6741d",
+  "authored_cases": 3,
+  "status": "known_development_regression"
+}

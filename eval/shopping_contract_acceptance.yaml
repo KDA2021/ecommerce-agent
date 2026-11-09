@@ -1,0 +1,106 @@
+version: 1
+scope: Fresh authored combinations; same catalog/families, not external blind evaluation
+cases:
+- id: new-original-usd-boundary
+  split: acceptance
+  category: fresh_constraint_combination
+  description: New authored combination on the same seeded catalog and known task
+    families, unrun and not human accepted.
+  turns:
+  - query: CascadePro钛合金折叠登山杖一对，送欧盟，标价最多148美元，按原币种，不含运税；没有合格款就明确说没有。
+    oracle:
+      candidate_ids:
+      - P1010
+      max_price: '148'
+      country: EU
+      currency: USD
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: new-tea-set-boundary
+  split: acceptance
+  category: fresh_constraint_combination
+  description: New authored combination on the same seeded catalog and known task
+    families, unrun and not human accepted.
+  turns:
+  - query: 去日本带TerraCotta一壶两杯的粗陶旅行茶具套装，商品价上限267元，不含运税，不接受单杯。
+    oracle:
+      candidate_ids:
+      - P1006
+      max_price: '267'
+      country: JP
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: new-carbon-destination
+  split: acceptance
+  category: fresh_constraint_combination
+  description: New authored combination on the same seeded catalog and known task
+    families, unrun and not human accepted.
+  turns:
+  - query: 我要TrekPole碳纤维登山杖一对，寄日本，商品价不超过500元，不含运税；不能寄就不要推荐其他品类。
+    oracle:
+      candidate_ids:
+      - P1047
+      max_price: '500'
+      country: JP
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: new-lamp-eu-exact-cap
+  split: acceptance
+  category: fresh_constraint_combination
+  description: New authored combination on the same seeded catalog and known task
+    families, unrun and not human accepted.
+  turns:
+  - query: 给欧盟地址买可充电露营灯，商品价89元以内，不含运税，不要钥匙扣手电。
+    oracle:
+      candidate_ids:
+      - P1008
+      - P1039
+      max_price: '89'
+      country: EU
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: &id001
+      - P1008
+      min_recommendations: 1
+      required_price_ids: *id001
+- id: new-reader-under-cap
+  split: acceptance
+  category: fresh_constraint_combination
+  description: New authored combination on the same seeded catalog and known task
+    families, unrun and not human accepted.
+  turns:
+  - query: SDVault高速存储卡读卡器，寄中国，商品价不超过78元，不含运税；不要替换成线材。
+    oracle:
+      candidate_ids:
+      - P1030
+      max_price: '78'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: new-flask-us-exact-cap
+  split: acceptance
+  category: fresh_constraint_combination
+  description: New authored combination on the same seeded catalog and known task
+    families, unrun and not human accepted.
+  turns:
+  - query: HydroFlow 316不锈钢保温水壶寄美国，商品标价最多189元，不含运税，说明匹配款的原始标价即可。
+    oracle:
+      candidate_ids:
+      - P1045
+      max_price: '189'
+      country: US
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: &id002
+      - P1045
+      min_recommendations: 1
+      required_price_ids: *id002

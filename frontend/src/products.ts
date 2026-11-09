@@ -245,7 +245,7 @@ export function buildComparisonRows(payload: unknown): ComparisonRow[] {
         product_id: readString(pick, "product_id") ?? "",
         title: readString(pick, "title") ?? "未命名商品",
         price: formatMoney(priceMajor, readString(pick, "currency")),
-        landedTotal: formatMoney(landed, readString(pick, "currency")),
+        landedTotal: formatMoney(landed, readString(pick, "landed_currency") ?? readString(pick, "currency")),
         weight: readString(pick, "weight") ?? PLACEHOLDER,
         originCountry: readString(pick, "origin_country") ?? PLACEHOLDER,
         shipsTo: readStringArray(pick, "ships_to").join(" / ") || PLACEHOLDER,

@@ -290,7 +290,7 @@ def test_optional_new_fields_are_strictly_validated(grader):
     observed["comparison_reasoning"] = {"value": "false", "evidence": ""}
     with pytest.raises(ValueError):
         grader.parse_extraction(json.dumps(observed))
-    observed = extraction(claims=[price(basis="converted")])
+    observed = extraction(claims=[price(basis="invented")])
     with pytest.raises(ValueError):
         grader.parse_extraction(json.dumps(observed))
 
@@ -328,6 +328,35 @@ def test_unique_price_bullet_inherits_nearest_product_heading_without_mutating_e
     assert check["expanded_evidence"] in reply
     assert "Alpha 30W充电器" in check["expanded_evidence"]
     assert json.dumps(observed, ensure_ascii=False) == raw
+
+
+@pytest.mark.parametrize('wording', [
+    'P1 到手价参考：114.10元（商品89.10元+运费25元）',
+    'P1 到手价：商品89.10元 + 运费25元 + 关税0元（适用低值免税）= **114.10元**',
+    'P1 到手价（寄中国）：商品89.10元 + 运费25元 + 关税0元 = **114.10元**',
+    'P1 到手合计约 **114.10元**',
+    'P1\n**寄到日本的到手价参考（含运费与税费）**\n- 商品小计：89.10元\n- 运费：25元\n- 关税：0元\n- **合计：114.10元**',
+])
+def test_tool_backed_landed_price_supports_reference_labels_and_markdown_totals(grader, catalog, wording):
+    catalog['P1']['observed_prices'] = [{'amount':'114.10','currency':'CNY','basis':'landed_total'}]
+    observed = extraction([rec(evidence='P1')],
+                          [price('114.10', evidence=wording, amount_text='114.10元', basis='landed')])
+    assert evaluate(grader, catalog, observed, wording)['passed']
+
+
+@pytest.mark.parametrize('wording', [
+    'P1 商品价114.10元，到手价另计',
+    'P1 到手价参考：商品89.10元 + 运费25元 = **999元**',
+    'P1 商品标价\n- 合计：114.10元',
+    'P1 到手价\n## P2 新商品\n- 运费：25元\n- 合计：114.10元',
+    'P1 到手价\n- 商品小计：114.10元\n- 运费：25元\n- 合计：139.10元',
+])
+def test_landed_format_support_still_rejects_wrong_basis_or_unobserved_total(grader, catalog, wording):
+    catalog['P1']['observed_prices'] = [{'amount':'114.10','currency':'CNY','basis':'landed_total'}]
+    amount = '999' if '999' in wording else '114.10'
+    observed = extraction([rec(evidence='P1')],
+                          [price(amount, evidence=wording, amount_text=amount+'元', basis='landed')])
+    assert not evaluate(grader, catalog, observed, wording)['passed']
 
 
 @pytest.mark.parametrize("prefix", [

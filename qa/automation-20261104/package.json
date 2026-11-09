@@ -1,0 +1,7 @@
+{
+  "name": "ecommerce-automation-regression",
+  "private": true,
+  "type": "module",
+  "scripts": {"test:web": "playwright test"},
+  "devDependencies": {"playwright": "1.62.1"}
+}

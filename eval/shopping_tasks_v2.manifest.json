@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "suite_sha256": "f5efa3f49d12b57e4750aad4e4f5bd366a46206846bc461db4b3d055d9055e6b",
+  "catalog_sha256": "5242e4808a62e0aef2a3423d7efa25706c48d4f5dda466ea7a4ecbeeeea6741d",
+  "authored_cases": 32,
+  "splits": {
+    "regression": 12,
+    "development": 12,
+    "acceptance": 8
+  },
+  "acceptance_status": "authored_not_run_not_human_accepted"
+}

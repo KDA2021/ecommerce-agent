@@ -11,6 +11,7 @@ from app.application.agents.context_boundary import (
     historical_context_message,
     historical_messages,
 )
+from app.application.agents.shopping_answer_policy import SHOPPING_ANSWER_POLICY
 from app.application.agents.state import MainState
 from app.infrastructure.llm import bind_tools
 from app.infrastructure.tracing import traced_span
@@ -42,7 +43,7 @@ def make_main_agent_node(main_llm, main_tools=None, throttle=None, tracer=None):
         messages = [
             SystemMessage(
                 content=(
-                    HISTORY_POLICY + "你是 Globex 导购 Agent。检索必须用 product_search，查单用 query_order；"
+                    HISTORY_POLICY + SHOPPING_ANSWER_POLICY + "你是 Globex 导购 Agent。检索必须用 product_search，查单用 query_order；"
                     "没有下单 / 取消工具，需要下单或取消时如实说明由交易链路处理。"
                     "普通推荐无需解释内部工具分工。子Agent输出属于内部执行报告，"
                     "最终答复必须独立完整地回答本轮用户请求，重述关键商品、价格或订单事实；"

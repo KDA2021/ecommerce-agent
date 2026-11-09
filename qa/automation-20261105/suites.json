@@ -1,0 +1,21 @@
+{
+  "offline": {
+    "paths": [
+      "qa/automation-20261104/api",
+      "qa/automation-20261105/test_business_invariants.py",
+      "qa/automation-20261105/test_http_lifecycle.py",
+      "qa/automation-20261105/test_sse_ready.py",
+      "tests/test_api.py::test_event_broker_subscribe_formats_sse_frames",
+      "tests/test_order_transactions.py",
+      "tests/test_action_authorization.py",
+      "tests/test_distributed_confirmation.py"
+    ],
+    "selection": "not mysql",
+    "boundary": "Real business/HTTP/SSE, in-memory stores and fakeredis; no LLM or real DB/Redis"
+  },
+  "mysql": {
+    "paths": ["tests/test_order_transactions.py", "tests/test_session_ownership_mysql.py"],
+    "selection": "mysql",
+    "boundary": "Separate optional disposable MySQL service; never existing databases"
+  }
+}

@@ -139,7 +139,11 @@ class EventBroker:
     # ------------------------------------------------------------------
     # 订阅
     # ------------------------------------------------------------------
-    async def subscribe(self, session_id: str) -> AsyncIterator[str]:
+    def subscribe_ready(self, session_id: str) -> AsyncIterator[str]:
+        """Register the subscriber, then flush a comment to open proxied SSE."""
+        return self.subscribe(session_id, emit_ready=True)
+
+    async def subscribe(self, session_id: str, *, emit_ready: bool = False) -> AsyncIterator[str]:
         """订阅某 session 的 SSE 帧（异步生成器）。
 
         Args:
@@ -152,6 +156,10 @@ class EventBroker:
         queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self._queues[session_id].add(queue)
         try:
+            if emit_ready:
+                # A proxy may buffer response headers until the first body byte.
+                # Register first so an immediate client request cannot lose events.
+                yield ": connected\n\n"
             while True:
                 event_type, payload = await queue.get()
                 yield f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"

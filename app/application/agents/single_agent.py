@@ -15,6 +15,8 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from typing_extensions import TypedDict
 
+from app.application.agents.shopping_answer_policy import SHOPPING_ANSWER_POLICY
+
 
 class AgentState(TypedDict):
     """单 Agent 图 state：仅一个带 ``add_messages`` reducer 的 messages 通道。"""
@@ -29,7 +31,7 @@ _SYSTEM_PROMPT = """你是 Globex 跨境电商导购 Agent，负责商品检索�
 2. 只有买家明确确认后才调用 create_order；买家身份由系统注入，不要编造 buyer_id。
 3. 涉及金额的数字必须来自工具返回，不得自行估算。
 4. 工具返回 error 时如实告知买家，不要编造结果。
-5. 回答使用中文，简洁、具体。"""
+5. 回答使用中文，简洁、具体。""" + SHOPPING_ANSWER_POLICY
 
 
 def build_agent_graph(llm: Any, tools: list[Any], checkpointer: Any):

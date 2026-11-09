@@ -37,8 +37,11 @@ def build_events_router() -> APIRouter:
         """
         await authorize_session(request, shopping_session_id, claim=True)
         broker = get_container(request).broker
+        # Keep simple broker adapters compatible; the real broker emits a ready
+        # comment before waiting for business events, opening browser EventSource.
+        subscribe = getattr(broker, "subscribe_ready", broker.subscribe)
         return StreamingResponse(
-            broker.subscribe(shopping_session_id),
+            subscribe(shopping_session_id),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

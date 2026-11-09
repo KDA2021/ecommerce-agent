@@ -25,9 +25,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, replace
 from typing import Optional
 
+from app.application.usecases.catalog_pricing import catalog_pricing
 from app.application.usecases.recommendation_reasons import (
     build_reasons,
     preference_matches,
@@ -59,6 +61,7 @@ COMPARISON_TOP_N = 3
 
 # 单卡"偏好记忆命中"理由条数上限（只做上限，不编造：命中几条写几条）
 PREFERENCE_REASON_LIMIT = 3
+PRODUCT_FACT_TEXT_LIMIT = 400
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,9 @@ class ProductCard:
     landed_price: Optional[dict]  # ship_to 命中时的到手价明细，未命中为 None
     ships_to: Optional[list[str]] = None  # 可发国家二位码列表（对比视图展示用）
     reasons: Optional[list[dict]] = None  # 仅真实命中的推荐理由；无命中为空列表
+    description: str = ""
+    description_truncated: bool = False
+    pricing: Optional[dict] = None
 
     def __post_init__(self) -> None:
         """把可选集合字段补齐成空列表，避免下游拿到 None 再判空。"""
@@ -107,6 +113,12 @@ class ProductCard:
         }
         if self.landed_price is not None:
             card["landed_price"] = self.landed_price
+        if self.pricing is not None:
+            card['pricing'] = self.pricing
+        if self.description:
+            card['description'] = self.description
+            if self.description_truncated:
+                card['description_truncated'] = True
         return card
 
     def to_comparison(self) -> dict:
@@ -132,6 +144,7 @@ class ProductCard:
             "price_major": self.price_major,
             "currency": self.currency,
             "landed_total_major": landed_total,
+            "landed_currency": (self.landed_price or {}).get('currency'),
             "weight": weight,
             "origin_country": self.origin_country,
             "ships_to": list(self.ships_to or []),
@@ -203,6 +216,7 @@ class CatalogSearchUseCase:
         scored: list[tuple[float, Product]] = []
         recall_strategy = "keyword_2gram"
         rerank_applied = False
+        retrieval_diagnostics = None
 
         # 未配置 embedding / 向量索引时跳过向量召回，直接走关键词兜底。
         if self._embedder is not None and self._vector_index is not None:
@@ -214,14 +228,22 @@ class CatalogSearchUseCase:
                 scored = []
 
         if recall_strategy == "embedding_only" and scored:
+            scored, retrieval_diagnostics = await self._recover_candidates(spec, scored)
+            if retrieval_diagnostics and retrieval_diagnostics["added_candidate_ids"]:
+                recall_strategy = "embedding_keyword"
+
+        if recall_strategy in ("embedding_only", "embedding_keyword") and scored:
             # 二阶段精排；失败降级按向量分排序
             try:
                 scored = await self._rerank(spec, scored)
-                recall_strategy = "embedding_rerank"
+                recall_strategy = (
+                    "embedding_keyword_rerank" if recall_strategy == "embedding_keyword"
+                    else "embedding_rerank"
+                )
                 rerank_applied = True
             except Exception as err:  # noqa: BLE001
                 logger.warning("rerank 不可用，按向量分排序：%s", err)
-        elif not scored:
+        elif not scored and retrieval_diagnostics is None:
             # 向量召回为空：走关键词 2-gram 兜底。
             scored = await self._keyword_recall(spec)
             recall_strategy = "keyword_2gram"
@@ -247,6 +269,8 @@ class CatalogSearchUseCase:
             "recall_strategy": recall_strategy,
             "rerank_applied": rerank_applied,
         }
+        if retrieval_diagnostics is not None:
+            result["retrieval_diagnostics"] = retrieval_diagnostics
         if hits:
             # 前 3 个商品给前端并排对比（价格/重量/可发国家/亮点 + 推荐理由）。
             result["top_picks"] = [card.to_comparison() for card in hits[:COMPARISON_TOP_N]]
@@ -255,6 +279,140 @@ class CatalogSearchUseCase:
             # 会把超预算商品答成"没有这个商品"
             result["filtered_out"] = filtered_out
         return result
+
+    @staticmethod
+    def _query_identities(query: str) -> tuple[str, ...]:
+        """Positive Latin brand/model/ID tokens; excluded brands are not promoted."""
+        identifiers = []
+        for match in re.finditer(r"(?<![A-Za-z0-9])[A-Za-z0-9][A-Za-z0-9_-]{2,}(?![A-Za-z0-9])", query):
+            word = match.group().casefold()
+            prefix = query[max(0, match.start() - 20):match.start()]
+            if word.isdecimal():
+                continue  # Standalone amounts/counts belong to structured constraints, not model IDs.
+            if word in {"cny", "usd", "rmb", "usb", "type-c", "anc", "gan"}:
+                continue
+            if re.search(r"(?:不要|不选|排除|不是|不含|拒绝|without|except|not)\s*$", prefix, re.I):
+                continue
+            identifiers.append(word)
+        return tuple(identifiers)
+
+    @staticmethod
+    def _identity_matches(product: Product, identifiers: tuple[str, ...]) -> bool:
+        names = [product.product_id, product.brand, product.title,
+                 re.sub(r"\s+", "", product.title), *(sku.sku_id for sku in product.skus)]
+        return all(any(re.search(r"(?<![A-Za-z0-9])" + re.escape(token) + r"(?![A-Za-z0-9])",
+                                 name, re.I) for name in names) for token in identifiers)
+
+    @staticmethod
+    def _resolve_identities(identifiers: tuple[str, ...], products: list[Product],
+                            has_category: bool) -> tuple[str, ...]:
+        """Resolve Latin words to catalog identities while retaining unknown models.
+
+        With an explicit category, unmatched alphabetic words are modifiers.
+        Digit-bearing unknown names remain constraints, never category aliases.
+        """
+        known = {token for token in identifiers for product in products
+                 if token == product.brand.casefold() or token == product.product_id.casefold()
+                 or any(token == sku.sku_id.casefold() for sku in product.skus)}
+        if has_category or known:
+            return tuple(token for token in identifiers
+                         if token in known or any(char.isdigit() for char in token))
+        return identifiers
+
+    @staticmethod
+    def _category_aliases(category: str) -> set[str]:
+        """Small domain vocabulary; unknown labels retain literal-only matching.
+
+        Only complete labels in these groups are interchangeable. In particular,
+        material/activity overlap and arbitrary suffixes do not identify a category.
+        Extend this vocabulary with reviewed catalog nouns as coverage grows.
+        """
+        groups = (
+            {'露营灯', '营地灯'},
+            {'炊具', '锅具', '套锅', '露营锅', '露营炊具', '户外炊具',
+             '露营锅具', '户外锅具', '露营套锅', '户外套锅',
+             '炊具套装', '锅具套装', '露营炊具套装', '户外炊具套装'},
+        )
+        return next((group for group in groups if category in group), {category})
+
+    @staticmethod
+    def _category_matches(product: Product, category: str) -> bool:
+        """Match an explicit category against catalog facts, independent of modifiers.
+
+        This is deliberately lexical. The small alias set expresses equivalent
+        category names, not arbitrary query properties such as solar power.
+        """
+        category = category.strip().casefold()
+        aliases = CatalogSearchUseCase._category_aliases(category)
+        return bool(category) and any(
+            alias in text.casefold()
+            for alias in aliases
+            for text in (product.category, product.title, product.description)
+        )
+
+    async def _recover_candidates(self, spec: ProductSearchSpec, scored: list) -> tuple[list, dict | None]:
+        """One local scan for generic categories or missing explicit query anchors.
+
+        The merged pool is bounded by _RECALL_TOP_N. All price/shipping checks still
+        run afterward. This uses the existing small-catalog list_all fallback, not
+        an additional model call or a general proof that no matching item exists.
+        """
+        identifiers = self._query_identities(spec.normalized_query)
+        generic_category = bool(spec.category and not identifiers)
+        anchors = [term.casefold() for term in spec.normalized_query.split()
+                   if len(term) >= 3 and any('\u4e00' <= char <= '\u9fff' for char in term)]
+        if spec.category:
+            anchors.append(spec.category.casefold())
+
+        def aligned(product):
+            if identifiers:
+                return self._identity_matches(product, identifiers)
+            if generic_category:
+                return self._category_matches(product, spec.category)
+            return not anchors or any(term in product.searchable_text().casefold() for term in anchors)
+
+        trigger = None
+        if not any(aligned(product) for _, product in scored):
+            trigger = "named_identity_missing" if identifiers else "lexical_mismatch"
+        elif generic_category:
+            trigger = "category_supplement"
+        elif all(self._reject_reason(product, spec) is not None for _, product in scored):
+            trigger = "all_candidates_filtered"
+        if trigger is None:
+            return scored, None
+        try:
+            lexical = await self._keyword_recall(spec)
+        except Exception as error:  # Best-effort supplement must not discard vector results.
+            return scored, {
+                'fallback_trigger': trigger, 'vector_candidate_ids':[p.product_id for _,p in scored],
+                'keyword_candidate_ids':[], 'added_candidate_ids':[], 'keyword_scans':1,
+                'error_type':type(error).__name__,
+            }
+        # Resolve Latin anchors against catalog identities before treating them
+        # as mandatory: "reader" in "SDVault reader" is not another model name.
+        identifiers = self._resolve_identities(identifiers, [p for _, p in lexical], bool(spec.category))
+        generic_category = bool(spec.category and not identifiers)
+        if generic_category:
+            trigger = ('category_supplement' if any(aligned(p) for _, p in scored)
+                       else 'lexical_mismatch')
+        lexical = [(score, product) for score, product in lexical if aligned(product)]
+        existing = {product.product_id for _, product in scored}
+        merged, seen = [], set()
+        vector_pool = [(score, product) for score, product in scored
+                       if not generic_category or aligned(product)]
+        for row in [*lexical, *vector_pool]:
+            if row[1].product_id not in seen:
+                merged.append(row)
+                seen.add(row[1].product_id)
+            if len(merged) == _RECALL_TOP_N:
+                break
+        return merged, {
+            "fallback_trigger": trigger,
+            "vector_candidate_ids": [product.product_id for _, product in scored],
+            "keyword_candidate_ids": [product.product_id for _, product in lexical[:_RECALL_TOP_N]],
+            "added_candidate_ids": [product.product_id for _, product in merged if product.product_id not in existing],
+            "keyword_scans": 1,
+        }
 
     async def _with_buyer_preferences(self, spec: ProductSearchSpec) -> ProductSearchSpec:
         """把买家长期偏好注入检索规格（供 reasons 计算），失败不阻断检索。
@@ -293,6 +451,8 @@ class CatalogSearchUseCase:
         if spec.ship_to and spec.ship_to not in product.ships_to:
             return "ship_to_unavailable"
         if not self._within_price_cap(product, spec):
+            if spec.ship_to and "unavailable_reason" in (self._landed_price(product, spec) or {}):
+                return "landed_price_unavailable"
             return "over_price_cap"
         return None
 
@@ -307,13 +467,17 @@ class CatalogSearchUseCase:
         Returns:
             摘要 dict。
         """
-        primary_in_target = self._tariff.rates.convert(product.primary_sku().price, spec.target_currency)
+        primary = product.primary_sku()
+        landed = self._landed_price(product, spec) if reason != "ship_to_unavailable" else None
         return {
             "product_id": product.product_id,
             "title": product.title,
             "category": product.category,
-            "price_major": round(primary_in_target.to_major_units(), 2),
-            "currency": spec.target_currency,
+            "price_major": primary.price.to_major_units(),
+            "currency": primary.price.currency,
+            "pricing": catalog_pricing(primary.price, primary.sku_id, self._tariff.rates,
+                                       spec.target_currency, landed),
+            **({"landed_price": landed} if landed is not None else {}),
             "reason": reason,
         }
 
@@ -329,8 +493,27 @@ class CatalogSearchUseCase:
         """
         if spec.price_max_major is None:
             return True
+        if spec.ship_to:
+            landed = self._landed_price(product, spec)
+            return bool(landed and "landed_total_major" in landed
+                        and landed["landed_total_major"] <= spec.price_max_major)
         primary_in_target = self._tariff.rates.convert(product.primary_sku().price, spec.target_currency)
         return primary_in_target.to_major_units() <= spec.price_max_major
+
+    def _landed_price(self, product: Product, spec: ProductSearchSpec) -> Optional[dict]:
+        """Use one quotation policy for filtering, cards and rejection evidence."""
+        if not spec.ship_to:
+            return None
+        try:
+            return self._tariff.quote(
+                subtotal=product.primary_sku().price,
+                category=product.category,
+                ship_to=spec.ship_to,
+                quantity=1,
+                target_currency=spec.target_currency,
+            ).to_dict()
+        except ValueError as err:
+            return {"unavailable_reason": str(err)}
 
     # ---- 一阶段：向量召回 ----
 
@@ -426,13 +609,22 @@ class CatalogSearchUseCase:
             ``[(score, Product)]``。
         """
         query_terms = tokenize(spec.normalized_query)
+        products = await self._product_repo.list_all()
+        identifiers = self._query_identities(spec.normalized_query)
+        if spec.category:
+            identifiers = self._resolve_identities(identifiers, products, True)
+        generic_category = bool(spec.category and not identifiers)
         candidates: list[tuple[float, Product]] = []
-        for product in await self._product_repo.list_all():
+        for product in products:
+            if generic_category and not self._category_matches(product, spec.category):
+                continue
             score = self._keyword_score(query_terms, product, spec)
             if score > 0:
                 candidates.append((score, product))
         candidates.sort(key=lambda pair: pair[0], reverse=True)
-        return candidates
+        # Named recovery resolves identity tokens over the full lexical pool
+        # before applying its own bound; do not truncate that resolution early.
+        return candidates[:_RECALL_TOP_N] if generic_category else candidates
 
     @staticmethod
     def _keyword_score(query_terms: set[str], product: Product, spec: ProductSearchSpec) -> float:
@@ -446,13 +638,17 @@ class CatalogSearchUseCase:
         Returns:
             关键词得分（无重合为 0.0）。
         """
-        doc_terms = tokenize(product.searchable_text())
+        doc_terms = tokenize(" ".join([product.product_id, *(sku.sku_id for sku in product.skus), product.searchable_text()]))
         matched = query_terms & doc_terms
-        if not matched:
+        query_ids = set(CatalogSearchUseCase._query_identities(spec.normalized_query))
+        exact_id = any(identifier.casefold() in query_ids for identifier in
+                       (product.product_id, *(sku.sku_id for sku in product.skus)))
+        category_match = bool(spec.category and CatalogSearchUseCase._category_matches(product, spec.category))
+        if not matched and not exact_id and not category_match:
             return 0.0
-        score = float(len(matched))
+        score = float(len(matched)) + (10.0 if exact_id else 0.0)
         # 品类槽位命中加权，让"槽位过滤"优于全文命中
-        if spec.category and spec.category in product.category:
+        if category_match:
             score += 3.0
         return score
 
@@ -514,20 +710,7 @@ class CatalogSearchUseCase:
             ProductCard。
         """
         primary = product.primary_sku()
-        landed_price: Optional[dict] = None
-        if spec.ship_to:
-            try:
-                quote = self._tariff.quote(
-                    subtotal=primary.price,
-                    category=product.category,
-                    ship_to=spec.ship_to,
-                    quantity=1,
-                    target_currency=spec.target_currency,
-                )
-                landed_price = quote.to_dict()
-            except ValueError as err:
-                # 目的国不在规则表内：如实标注，不编造数字
-                landed_price = {"unavailable_reason": str(err)}
+        landed_price = self._landed_price(product, spec)
         return ProductCard(
             product_id=product.product_id,
             title=product.title,
@@ -551,4 +734,8 @@ class CatalogSearchUseCase:
             landed_price=landed_price,
             ships_to=list(product.ships_to),
             reasons=self._to_reasons(product, spec, landed_price),
+            description=product.description[:PRODUCT_FACT_TEXT_LIMIT],
+            description_truncated=len(product.description)>PRODUCT_FACT_TEXT_LIMIT,
+            pricing=catalog_pricing(primary.price, primary.sku_id, self._tariff.rates,
+                                    spec.target_currency, landed_price),
         )

@@ -1,0 +1,607 @@
+version: 2
+scope: 32 authored synthetic scenarios; not production traffic. New acceptance cases have not been run
+  or used for Agent tuning. This is not a third-party blind test.
+oracle_policy: Candidate category/material membership is hand-curated; price/currency/country checks are
+  deterministic and do not prove natural-language semantics.
+cases:
+- id: shopping-travel-set-budget
+  category: simple_budget
+  description: 中国配送、200 CNY 内的旅行三件套；全部合格项为 Nomadica 189、Voyager 139。毛巾三件装不属于颈枕眼罩旅行套装。
+  turns:
+  - query: 帮我找个含颈枕、眼罩的旅行三件套，寄中国，商品标价200元以内，不含运税。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1001
+      - P1011
+      min_recommendations: 1
+  split: regression
+- id: shopping-charger-japan
+  category: multiple_constraints
+  description: 寄日本、170 CNY 内的充电器全部为 30W 89、65W 159；100W 299 超预算，转换插头不是充电器。
+  turns:
+  - query: 我要寄到日本的手机快充充电器，商品标价170元以内，不含运税，不是转换插头，推荐一下。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1005
+      - P1024
+      min_recommendations: 1
+  split: regression
+- id: shopping-compare-chargers
+  category: comparison
+  description: 明确比较 VoltTrek 30W 与 65W；两组均须出现，价格按主 SKU 89/159 CNY。
+  turns:
+  - query: 帮我对比VoltTrek的30W迷你充电器和65W旅行充电器，分别多少钱、适合什么用法？只比较这两款。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1024
+      - P1005
+      min_recommendations: 2
+      required_groups:
+      - - P1024
+      - - P1005
+      required_price_ids:
+      - P1024
+      - P1005
+      require_comparison_reasoning: true
+  split: regression
+- id: shopping-reference-first
+  category: followup_reference
+  description: 第一轮150 CNY内的颈枕眼罩三件套只有Voyager 139；第二轮要求把刚才第一款与Nomadica 189比较，二者都合格。
+  turns:
+  - query: 推荐一款商品标价150元以内、寄中国、含颈枕和眼罩的旅行三件套，不含运税。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1011
+      min_recommendations: 1
+  - query: 刚才第一款和Nomadica旅行三件套有什么差别？现在商品标价预算200元，不含运税，两款都帮我比较一下。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1011
+      - P1001
+      min_recommendations: 2
+      required_groups:
+      - - P1011
+      - - P1001
+      required_price_ids:
+      - P1011
+      - P1001
+      require_comparison_reasoning: true
+  split: regression
+- id: shopping-revise-budget
+  category: changed_budget
+  description: 100 CNY 内只有30W 89；预算提高到180且明确至少65W后，只有65W 159合格，100W 299不合格。
+  turns:
+  - query: 给我推荐中国能收货、商品标价100元以内的VoltTrek充电器，不含运税。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1024
+      min_recommendations: 1
+  - query: 商品标价预算提高到180元，仍不含运税，功率要至少65W，重新推荐。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1005
+      min_recommendations: 1
+      must_not_recommend_ids:
+      - P1024
+      - P1025
+  split: regression
+- id: shopping-change-country
+  category: changed_country
+  description: 中国150 CNY内背包为Wanderlite 129与BudgetPack 39；两者都不寄美国，唯一寄美国背包DryPack 219超预算。
+  turns:
+  - query: 推荐一个寄中国、商品标价150元以内的双肩背包，不含运税。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1003
+      - P1049
+      min_recommendations: 1
+  - query: 收货地改成美国了，还是商品标价150元以内的双肩背包，不含运税，帮我重新筛。
+    expectation:
+      mode: no_match
+      eligible_ids: []
+      must_not_recommend_ids:
+      - P1003
+      - P1049
+      - P1018
+  split: regression
+- id: shopping-remember-material
+  category: persistent_preference
+  description: 新会话仍避开塑料：20寸箱只有TrailOx 899（PC箱体）与GlideCase 399（PC硬壳），均不满足避塑料。DB必须有结构化dislike/material/塑料。
+  turns:
+  - query: 请记住我的长期偏好：不喜欢塑料材质，以后购物推荐都避开塑料。
+    expectation:
+      mode: ack
+      eligible_ids: []
+      preference:
+        kind: dislike
+        attribute: material
+        value: 塑料
+  - query: 推荐一个寄中国、商品标价1000元以内的20寸登机行李箱，不含运税。
+    fresh_session: true
+    expectation:
+      mode: no_match
+      eligible_ids: []
+      must_not_recommend_ids:
+      - P1002
+      - P1016
+      preference:
+        kind: dislike
+        attribute: material
+        value: 塑料
+  split: regression
+- id: shopping-forget-material
+  category: preference_revision
+  description: 先记住再明确删除避塑料偏好；删除后新会话中国500 CNY内20寸登机箱只有GlideCase 399。每轮检查DB偏好存在/不存在。
+  turns:
+  - query: 记住，我不喜欢塑料材质，今后推荐请避开。
+    expectation:
+      mode: ack
+      eligible_ids: []
+      preference:
+        kind: dislike
+        attribute: material
+        value: 塑料
+  - query: 忘掉我不喜欢塑料材质这条偏好，以后塑料材质也可以推荐。
+    expectation:
+      mode: ack
+      eligible_ids: []
+      forbidden_preferences:
+      - kind: dislike
+        attribute: material
+        value: 塑料
+  - query: 推荐一个寄中国、商品标价500元以内的20寸登机箱，不含运税。
+    fresh_session: true
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1016
+      min_recommendations: 1
+      forbidden_preferences:
+      - kind: dislike
+        attribute: material
+        value: 塑料
+  split: regression
+- id: shopping-impossible-budget
+  category: impossible_budget
+  description: 20 CNY内没有背包；最便宜BudgetPack 39。应如实无匹配，不能把超预算商品当成满足条件的推荐。
+  turns:
+  - query: 商品标价预算只有20元，不含运税，想买个寄中国的双肩背包，严格不能超预算，有合适的吗？
+    expectation:
+      mode: no_match
+      eligible_ids: []
+  split: regression
+- id: shopping-nonexistent-product
+  category: honest_no_match
+  description: 60 SPU中没有诺基亚3310手机壳；不可把三脚架、读卡器、数据线当成匹配手机壳。
+  turns:
+  - query: 帮我找一个诺基亚3310专用手机壳，要寄中国；只要这个型号的手机壳。
+    expectation:
+      mode: no_match
+      eligible_ids: []
+  split: regression
+- id: shopping-clarify-need
+  category: underspecified
+  description: 只说要买旅行用品，未给具体品类、预算和目的；期望先提出有内容的需求澄清，不指定唯一措辞。
+  turns:
+  - query: 我想买点旅行用品，你先帮我确定需求吧。
+    expectation:
+      mode: clarify
+      eligible_ids: []
+  split: regression
+- id: shopping-usd-headphones
+  category: currency_constraint
+  description: 寄美国、200 USD内、主动降噪耳机只有SilentBuds 189 USD；AeroHush Pro 219 USD超预算，Lite 299 CNY仅通话降噪，不擅自换汇。
+  turns:
+  - query: 推荐寄美国的主动降噪耳机，商品标价200美元以内，不含运税，价格用商品原币种，不要自行换汇。
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1023
+      min_recommendations: 1
+      must_not_recommend_ids:
+      - P1004
+      - P1022
+  split: regression
+- id: shopping-v2-inclusive-budget
+  category: budget_boundary
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 只要VoltTrek 30W迷你充电器，寄中国，商品标价89元以内，等于89也可以，不含运税。
+    oracle:
+      candidate_ids: &id001
+      - P1024
+      max_price: '89'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id001
+      min_recommendations: 1
+- id: shopping-v2-below-budget
+  category: budget_boundary
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 只要VoltTrek 30W迷你充电器，寄中国，商品标价最多88元，不含运税，超出就不要推荐。
+    oracle:
+      candidate_ids:
+      - P1024
+      max_price: '88'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: shopping-v2-100w-japan
+  category: power_constraint
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要至少100W的VoltTrek充电器，寄日本，商品标价不超过299元，不含运税。
+    oracle:
+      candidate_ids: &id002
+      - P1025
+      max_price: '299'
+      country: JP
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id002
+      min_recommendations: 1
+- id: shopping-v2-three-budget-changes
+  category: repeated_revision
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 推荐寄中国的VoltTrek充电器，商品标价100元以内，不含运税。
+    oracle:
+      candidate_ids:
+      - P1024
+      - P1005
+      - P1025
+      max_price: '100'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1024
+      min_recommendations: 1
+  - query: 预算改到180元，而且功率至少65W，其他条件不变。
+    oracle:
+      candidate_ids:
+      - P1005
+      - P1025
+      max_price: '180'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1005
+      min_recommendations: 1
+  - query: 最后改成至少100W，预算300元，仍寄中国，按标价筛选。
+    oracle:
+      candidate_ids: &id003
+      - P1025
+      max_price: '300'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id003
+      min_recommendations: 1
+- id: shopping-v2-card-reader
+  category: specific_accessory
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要SDVault双口读卡器，寄欧盟，商品标价80元以内，不含运税，不要数据线或三脚架。
+    oracle:
+      candidate_ids: &id004
+      - P1030
+      max_price: '80'
+      country: EU
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id004
+      min_recommendations: 1
+- id: shopping-v2-battery-shipping
+  category: shipping_restriction
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: PowerCore 10000mAh移动电源能寄美国吗？预算150元，按商品标价，不含运税，不能寄就不要推荐。
+    oracle:
+      candidate_ids:
+      - P1026
+      max_price: '150'
+      country: US
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: shopping-v2-bamboo-cutlery
+  category: material_and_category
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 推荐一套竹制的可重复使用餐具，寄欧盟，商品标价70元以内，不含运税，不要隔热垫。
+    oracle:
+      candidate_ids: &id005
+      - P1033
+      max_price: '70'
+      country: EU
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id005
+      min_recommendations: 1
+- id: shopping-v2-linen-japan
+  category: natural_material
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要LinenHome纯亚麻抱枕套，寄日本，商品标价80元以内，不含运税，不是旅行收纳袋。
+    oracle:
+      candidate_ids: &id006
+      - P1034
+      max_price: '80'
+      country: JP
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id006
+      min_recommendations: 1
+- id: shopping-v2-linen-us
+  category: unavailable_country
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要LinenHome纯亚麻抱枕套，寄美国，商品标价80元以内，不含运税；不能寄美国就直说。
+    oracle:
+      candidate_ids:
+      - P1034
+      max_price: '80'
+      country: US
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: shopping-v2-umbrella-japan
+  category: travel_weather
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 推荐MiniUmbrella五折遮阳伞，寄日本，商品标价90元以内，不含运税。
+    oracle:
+      candidate_ids: &id007
+      - P1057
+      max_price: '90'
+      country: JP
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id007
+      min_recommendations: 1
+- id: shopping-v2-compare-mugs
+  category: comparison
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 只对比TerraCotta手工陶土随行杯和Nordic陶瓷咖啡杯，寄中国，标价都在150元以内。分别多少钱，使用上有什么差异？不含运税。
+    oracle:
+      candidate_ids: &id008
+      - P1031
+      - P1032
+      max_price: '150'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id008
+      min_recommendations: 1
+      required_groups:
+      - - P1031
+      - - P1032
+      required_price_ids:
+      - P1031
+      - P1032
+      require_comparison_reasoning: true
+- id: shopping-v2-clarify-poles
+  category: explicit_clarification
+  split: development
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我想买折叠登山杖，你先问清我的预算和收货国家，再开始推荐。
+    expectation:
+      mode: clarify
+      eligible_ids: []
+- id: shopping-v2-titanium-cookware
+  category: outdoor_cookware
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 推荐钛合金露营炊具套装，寄中国，商品标价450元以内，不含运税，不是登山杖。
+    oracle:
+      candidate_ids: &id009
+      - P1048
+      max_price: '450'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id009
+      min_recommendations: 1
+- id: shopping-v2-carbon-poles
+  category: carbon_material
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要一对碳纤维登山杖，寄欧盟，商品标价500元以内，不含运税，不要铝合金款。
+    oracle:
+      candidate_ids: &id010
+      - P1047
+      max_price: '500'
+      country: EU
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id010
+      min_recommendations: 1
+- id: shopping-v2-usd-titanium-poles
+  category: currency_constraint
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要CascadePro钛合金折叠登山杖一对，寄欧盟，商品标价150美元以内，按原币种，不含运税，不自行换汇。
+    oracle:
+      candidate_ids: &id011
+      - P1010
+      max_price: '150'
+      country: EU
+      currency: USD
+    expectation:
+      mode: recommend
+      eligible_ids: *id011
+      min_recommendations: 1
+- id: shopping-v2-rope-us
+  category: unavailable_country
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要GripLine静力登山绳，寄美国，商品标价400元以内，不含运税，没有能寄的就直说。
+    oracle:
+      candidate_ids:
+      - P1044
+      max_price: '400'
+      country: US
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+- id: shopping-v2-tea-set
+  category: set_vs_single
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 我要TerraCotta陶土茶具套装，一壶两杯，不是单个随行杯，寄日本，商品标价270元以内，不含运税。
+    oracle:
+      candidate_ids: &id012
+      - P1006
+      max_price: '270'
+      country: JP
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id012
+      min_recommendations: 1
+- id: shopping-v2-camping-lamp
+  category: category_exclusion
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 推荐帐篷里用的露营灯，寄中国，商品标价100元以内，不含运税，不要钥匙扣手电。
+    oracle:
+      candidate_ids:
+      - P1008
+      - P1039
+      max_price: '100'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids:
+      - P1008
+      min_recommendations: 1
+- id: shopping-v2-lamp-budget-change
+  category: empty_to_available
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 推荐露营灯，寄中国，商品标价80元以内，不含运税，不要钥匙扣手电。
+    oracle:
+      candidate_ids:
+      - P1008
+      - P1039
+      max_price: '80'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+  - query: 商品标价预算提高到130元，仍寄中国，推荐合适的露营灯，不含运税。
+    oracle:
+      candidate_ids: &id013
+      - P1008
+      - P1039
+      max_price: '130'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id013
+      min_recommendations: 1
+- id: shopping-v2-forget-then-flask
+  category: preference_revision
+  split: acceptance
+  description: Authored synthetic case; oracle category membership is explicitly curated, numeric/shipping
+    constraints are checked offline.
+  turns:
+  - query: 记住，我不喜欢塑料材质，以后推荐请避开。
+    expectation:
+      mode: ack
+      eligible_ids: []
+      preference: &id014
+        kind: dislike
+        attribute: material
+        value: 塑料
+  - query: 删除我不喜欢塑料材质这条长期偏好，以后不需要按这条限制推荐。
+    expectation:
+      mode: ack
+      eligible_ids: []
+      forbidden_preferences:
+      - *id014
+  - query: 推荐HydroFlow 316不锈钢保温水壶，寄中国，商品标价200元以内，不含运税。
+    oracle:
+      candidate_ids: &id015
+      - P1045
+      max_price: '200'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id015
+      min_recommendations: 1
+      forbidden_preferences:
+      - *id014
+    fresh_session: true

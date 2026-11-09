@@ -138,6 +138,13 @@ test("buildComparisonRows 用后端 top_picks 生成前 3 行", () => {
   assert.equal(rows[1].landedTotal, "—");
 });
 
+test("对比表区分美元标价与人民币到手价", () => {
+  const rows = buildComparisonRows({top_picks: [{product_id: "P1010", title: "CascadePro",
+    price_major: 149, currency: "USD", landed_total_major: 1132.9, landed_currency: "CNY"}]});
+  assert.equal(rows[0].price, "149 USD");
+  assert.equal(rows[0].landedTotal, "1132.9 CNY");
+});
+
 test("buildComparisonRows 无 top_picks 时用 hits 兜底（最多 3 行）", () => {
   const rows = buildComparisonRows({ hits: [CARD, CARD, CARD, CARD] });
   assert.equal(rows.length, 3);

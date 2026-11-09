@@ -21,7 +21,7 @@ class ProductSearchSpec:
     top_k: int = 5
     # 到手价目标币种：命中 ship_to 时商品卡内联 landed_price（小计+运费+关税）
     target_currency: str = "CNY"
-    # 价格硬约束（目标币种主单位）：硬约束由检索链路结构化过滤，不交给 embedding/reranker
+    # 预算硬上限（目标币种主单位）：有 ship_to 按到手价，否则按商品价；结构化过滤
     price_max_major: Optional[float] = None
     # 买家长期偏好原文（如"喜欢小众设计"）：仅用于商品卡 reasons 的"偏好记忆命中"判定，
     # 不参与召回/排序。由检索入口从偏好存储读取后注入，模型不需要（也不应该）编造。

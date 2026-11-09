@@ -1,0 +1,69 @@
+version: 1
+scope: Known failures only; no generalization estimate
+cases:
+- id: contract-regression-titanium-cookware
+  category: outdoor_cookware
+  split: development
+  description: Previously inspected acceptance failure; now a development regression,
+    not unseen acceptance.
+  turns:
+  - query: 推荐钛合金露营炊具套装，寄中国，商品标价450元以内，不含运税，不是登山杖。
+    oracle:
+      candidate_ids: &id001
+      - P1048
+      max_price: '450'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id001
+      min_recommendations: 1
+  source_task_id: shopping-v2-titanium-cookware
+- id: contract-regression-usd-titanium-poles
+  category: currency_constraint
+  split: development
+  description: Previously inspected acceptance failure; now a development regression,
+    not unseen acceptance.
+  turns:
+  - query: 我要CascadePro钛合金折叠登山杖一对，寄欧盟，商品标价150美元以内，按原币种，不含运税，不自行换汇。
+    oracle:
+      candidate_ids: &id002
+      - P1010
+      max_price: '150'
+      country: EU
+      currency: USD
+    expectation:
+      mode: recommend
+      eligible_ids: *id002
+      min_recommendations: 1
+  source_task_id: shopping-v2-usd-titanium-poles
+- id: contract-regression-lamp-budget-change
+  category: empty_to_available
+  split: development
+  description: Previously inspected acceptance failure; now a development regression,
+    not unseen acceptance.
+  turns:
+  - query: 推荐露营灯，寄中国，商品标价80元以内，不含运税，不要钥匙扣手电。
+    oracle:
+      candidate_ids:
+      - P1008
+      - P1039
+      max_price: '80'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: no_match
+      eligible_ids: []
+  - query: 商品标价预算提高到130元，仍寄中国，推荐合适的露营灯，不含运税。
+    oracle:
+      candidate_ids: &id003
+      - P1008
+      - P1039
+      max_price: '130'
+      country: CN
+      currency: CNY
+    expectation:
+      mode: recommend
+      eligible_ids: *id003
+      min_recommendations: 1
+  source_task_id: shopping-v2-lamp-budget-change

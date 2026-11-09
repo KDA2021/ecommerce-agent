@@ -29,7 +29,10 @@ class ProductSearchArgs(BaseModel):
     category: str | None = Field(default=None, description="品类槽位，可选")
     ship_to: str | None = Field(default=None, description="收货国家二位码，可选，如 CN、US")
     top_k: int = Field(default=5, description="返回候选数量，默认 5")
-    price_max_major: float | None = Field(default=None, description="价格上限（主单位），硬约束")
+    price_max_major: float | None = Field(
+        default=None,
+        description="target_currency 主单位预算硬上限；给 ship_to 时按商品价+运费+关税过滤，否则按商品价过滤",
+    )
     target_currency: str = Field(default="CNY", description="价格口径币种，默认 CNY")
 
 
@@ -63,15 +66,18 @@ def build_product_search_tool(usecase: CatalogSearchUseCase, broker=None) -> Str
                 {"tool": "product_search", "error": str(err)},
             )
             return {"error": str(err)}
+        payload = {
+            "tool": "product_search", "hit_count": len(result.get("hits", [])),
+            "recall_strategy": result.get("recall_strategy"), "hits": result.get("hits", []),
+        }
+        if "retrieval_diagnostics" in result:
+            payload["retrieval_diagnostics"] = result["retrieval_diagnostics"]
+        if 'filtered_out' in result:
+            payload['filtered_out'] = result['filtered_out']
         _publish(
             broker,
             "tool.result",
-            {
-                "tool": "product_search",
-                "hit_count": len(result.get("hits", [])),
-                "recall_strategy": result.get("recall_strategy"),
-                "hits": result.get("hits", []),
-            },
+            payload,
         )
         return result
 
@@ -79,7 +85,8 @@ def build_product_search_tool(usecase: CatalogSearchUseCase, broker=None) -> Str
         name="product_search",
         description=(
             "检索跨境商品库，返回 Top-K 商品卡 JSON；传 ship_to 时内联到手价；"
-            "价格上限由本工具结构化过滤。"
+            "价格上限由本工具结构化过滤：有 ship_to 时比较含运费和关税的到手总价，"
+            "未给收货国时只能比较商品价，不代表含运税预算通过。"
             "每张卡的 reasons 是检索链路算好的事实理由（budget_match 预算命中 / "
             "ship_to_match 可发国家 / preference_match 买家偏好命中），只可如实转述，"
             "不要自己加理由；top_picks 是前 3 名对比行，可直接用于对比展示。"

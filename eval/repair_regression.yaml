@@ -1,0 +1,19 @@
+version: 1
+scope: Catalog-grounded development regression; not an untouched acceptance set.
+cases:
+  - id: repair-sdvault-catalog-exact
+    category: named_product_recovery
+    split: development
+    description: "按目录中的确切商品名称验证召回、79 CNY标价和EU配送。目录未确认接口数量，不声称双口。"
+    turns:
+      - query: "我要SDVault高速存储卡读卡器，寄欧盟，商品标价80元以内，不含运税。只推荐读卡器，不要用数据线或三脚架替代。"
+        oracle:
+          candidate_ids: [P1030]
+          currency: CNY
+          country: EU
+          max_price: '80'
+        expectation:
+          mode: recommend
+          eligible_ids: [P1030]
+          min_recommendations: 1
+          required_price_ids: [P1030]

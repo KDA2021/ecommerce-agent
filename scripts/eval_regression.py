@@ -198,17 +198,28 @@ def source_fingerprint(root: Path = ROOT) -> str:
 
 
 def build_run_metadata(settings, cases, run_id, started_at) -> dict:
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False
-    )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=False
-    )
+    git_commit, git_dirty, git_available = "unavailable", None, False
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+        if commit.returncode == dirty.returncode == 0 and commit.stdout.strip():
+            git_commit, git_dirty, git_available = (
+                commit.stdout.strip(),
+                bool(dirty.stdout.strip()),
+                True,
+            )
+    except OSError:
+        pass  # Slim runtime images may lack Git; source_fingerprint remains authoritative.
     return {
         "run_id": run_id,
         "started_at": started_at.isoformat(),
-        "git_commit": commit.stdout.strip() or "unavailable",
-        "git_dirty": bool(dirty.stdout.strip()),
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "git_available": git_available,
         "source_fingerprint": source_fingerprint(),
         "model": settings.llm_model,
         "judge_model": settings.llm_model,

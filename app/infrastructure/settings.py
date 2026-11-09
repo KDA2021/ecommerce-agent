@@ -164,6 +164,10 @@ class Settings:
     # ============================
     # 30s：容纳冷 CPU 精排（含 1.1GB 权重首次加载/预热），同时仍能熔断真正卡死的工具。
     tool_timeout_seconds: int = 30          # 单个业务工具调用的超时时间
+    chroma_timeout_seconds: float = 5.0     # Chroma 单次操作等待上限；检索超时降级关键词
+    chroma_max_concurrency: int = 2         # 每索引实例的查询并发上限，写入独占
+    chroma_max_queue: int = 8               # 等待名额的请求上限；0 表示不排队
+    chroma_queue_timeout_seconds: float = 0.2  # 等待名额上限，与操作超时分开
     tool_failure_threshold: int = 3         # 连续失败多少次打开熔断器
     tool_circuit_reset_seconds: float = 60.0  # 熔断器冷却多少秒后进入半开试探
 
@@ -373,6 +377,10 @@ def load_settings() -> Settings:
         # --- 工具韧性（P4）---
         # 默认 30s：冷 CPU 精排可能占用十几秒；15s 会让并行检索集体超时并误开熔断。
         tool_timeout_seconds=int(os.getenv("TOOL_TIMEOUT_SECONDS", "30")),
+        chroma_timeout_seconds=float(os.getenv("CHROMA_TIMEOUT_SECONDS", "5")),
+        chroma_max_concurrency=int(os.getenv("CHROMA_MAX_CONCURRENCY", "2")),
+        chroma_max_queue=int(os.getenv("CHROMA_MAX_QUEUE", "8")),
+        chroma_queue_timeout_seconds=float(os.getenv("CHROMA_QUEUE_TIMEOUT_SECONDS", "0.2")),
         tool_failure_threshold=int(os.getenv("TOOL_FAILURE_THRESHOLD", "3")),
         tool_circuit_reset_seconds=float(os.getenv("TOOL_CIRCUIT_RESET_SECONDS", "60.0")),
 
